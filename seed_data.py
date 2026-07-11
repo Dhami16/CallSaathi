@@ -6,6 +6,7 @@ Run directly: `python seed_data.py`
 import datetime
 import os
 
+import config  # noqa: F401 - importing this loads .env before we read os.getenv below
 from booking.db import get_connection, init_db
 
 DEMO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+15005550006")

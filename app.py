@@ -6,6 +6,7 @@ NotificationService). Nothing here ever touches a Twilio-specific type.
 import logging
 
 from flask import Flask, Response, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import configure_logging, load_config
 from telephony.twilio_adapter import TwilioProvider, validate_signature
@@ -16,6 +17,12 @@ config = load_config()
 configure_logging(config.log_level)
 
 app = Flask(__name__)
+# ngrok (and any reverse proxy) terminates HTTPS and forwards to Flask as
+# plain HTTP, setting X-Forwarded-Proto/Host to say so. Without this,
+# request.url reports "http://..." while Twilio signed the request using
+# the real "https://..." URL, so signature validation always fails behind
+# a tunnel/proxy.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 telephony_provider = TwilioProvider()
 
 # call_handler is created lazily on first request so importing app.py never
