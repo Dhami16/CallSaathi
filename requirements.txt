@@ -3,3 +3,10 @@ twilio==9.3.2
 groq==1.5.0
 python-dotenv==1.0.1
 pytest==8.3.3
+structlog==26.1.0
+sentry-sdk[flask]==2.64.0
+tenacity==9.1.4
+# Windows has no system IANA timezone database, so zoneinfo needs this to
+# resolve "Asia/Kolkata" (used for slot-time comparisons). Harmless/ignored
+# on platforms that already have system tzdata (most Linux/Mac hosts).
+tzdata==2026.3

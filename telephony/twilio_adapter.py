@@ -5,15 +5,15 @@ objects (VoiceResponse, Gather, RequestValidator, ...). Everything it hands
 back across the interface boundary is either a plain dict or a plain str
 (TwiML XML), never a Twilio object.
 """
-import logging
 from typing import Mapping
 
+import structlog
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
 from telephony.base import TelephonyProvider
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Twilio speech-recognition locale per business language_pref. Twilio's
 # speech model must pick a single locale per call; it does not truly
@@ -97,7 +97,7 @@ def validate_signature(url: str, form_params: Mapping[str, str], signature: str,
     telephony operation - but it still lives entirely in this adapter file.
     """
     if not auth_token:
-        logger.warning("No Twilio auth token configured; skipping signature validation")
+        logger.warning("stage", stage="telephony_webhook_received", outcome="error", reason="no_auth_token_configured")
         return True
     validator = RequestValidator(auth_token)
     return validator.validate(url, dict(form_params), signature)

@@ -20,23 +20,58 @@ with the full call transcript.
 ## Architecture
 
 ```
-telephony/        Provider-agnostic interface (TelephonyProvider) +
-                   telephony/twilio_adapter.py, the only file allowed to
-                   import Twilio-specific types.
-ai/conversation.py Groq-backed dialogue manager (in-memory session state,
-                   booking confirmation via a text marker, error fallback).
-booking/           SQLite schema (db.py) + data access (repository.py).
-notifications/     NotificationService interface + MockNotificationService.
-call_handler.py    Orchestrates telephony -> AI -> booking -> notifications.
-                   app.py never touches these subsystems directly.
-app.py             Flask routes only.
-seed_data.py       Idempotent demo business + slots.
+telephony/            Provider-agnostic interface (TelephonyProvider) +
+                       telephony/twilio_adapter.py, the only file allowed to
+                       import Twilio-specific types.
+ai/conversation.py     Groq-backed dialogue manager: session state lives in
+                       booking/session_store.py (not in-memory), booking
+                       confirmation via a text marker, retry + error fallback.
+booking/db.py          SQLite schema.
+booking/repository.py  Data access: businesses, slots (future-only, IST-aware),
+                       bookings (idempotent per call_id), call_logs, call_turns.
+booking/session_store.py  Externalized conversation session state (SQLite-
+                       backed) - see "Session state" below.
+notifications/         NotificationService interface + MockNotificationService.
+call_handler.py        Orchestrates telephony -> AI -> booking -> notifications.
+                       app.py never touches these subsystems directly.
+observability.py       Sentry init + non-fatal fallback event capture.
+stats.py               Aggregate queries backing GET /internal/stats.
+app.py                 Flask routes only.
+seed_data.py           Idempotent demo business + slots.
 ```
 
 Swapping the telephony vendor means writing a new adapter file implementing
 `TelephonyProvider` - nothing else changes. Swapping mock notifications for
 real WhatsApp/SMS means writing a new `NotificationService` - booking logic
 is untouched.
+
+## Session state: SQLite now, Redis later if needed
+
+Conversation state (message history, offered slots, turn count) used to
+live in a plain Python dict keyed by call_id - fine for one process, but it
+breaks silently the moment the app runs behind more than one gunicorn
+worker: Twilio's sequential webhook hits for a single call can land on
+different worker processes, each with separate memory, so the second hit
+wouldn't find the first hit's history.
+
+Fixed by externalizing session state behind a `SessionStore` interface
+(`booking/session_store.py`), with a SQLite-backed implementation used by
+default (`SQLiteSessionStore`, stored in the same DB file as everything
+else, table `call_sessions`, JSON-serialized). **Redis was considered and
+explicitly not chosen for now**: it's the more scalable long-term option
+(native TTL, no single-writer file lock), but it's new infrastructure a
+two-person team would have to run (Docker) or pay for/manage (hosted free
+tier) even at pilot stage, and SQLite's serialized writes aren't expected
+to be a practical bottleneck at pilot call volumes (small, fast
+one-row-per-turn writes, not sustained high throughput). If call volume
+grows enough that this becomes a real concern, swap in a
+`RedisSessionStore` implementing the same interface - nothing in
+`ai/conversation.py` or `call_handler.py` would need to change.
+
+Sessions expire after `SESSION_TTL_SECONDS` (default 600s / 10 min) so an
+abandoned or crashed call doesn't leak state forever; expired rows are
+cleaned up opportunistically on every write (no background job/cron
+needed).
 
 ## Setup
 
@@ -87,20 +122,18 @@ needed for that part.
 ## Running the local tests (no phone call needed)
 
 ```
-venv\Scripts\python -m pytest -s tests/test_booking_flow.py     # Phase 3: booking + notifications, no network
-venv\Scripts\python -m pytest -s tests/test_conversation.py     # Phase 2: real Groq calls, needs GROQ_API_KEY
+venv\Scripts\python -m pytest -q tests/                         # everything except the note below
+venv\Scripts\python -m pytest -s tests/test_conversation.py      # needs a real GROQ_API_KEY; skips otherwise
 ```
 
-`test_booking_flow.py` simulates a full call through `CallHandler` with a
-scripted fake conversation manager and fake telephony provider, then asserts
-the SQLite `bookings`/`slots`/`call_logs` rows and the mock notification log
-content are correct. No external services touched.
-
-`test_conversation.py` drives `ai.conversation.ConversationManager` directly
-with scripted caller turns (Hindi, code-switched Hindi/English, an
-out-of-scope pricing question) and prints the model's replies so you can
-sanity-check the persona. It needs a real `GROQ_API_KEY`; without one (or if
-the key is invalid) it skips rather than fails.
+| File | What it covers | Needs network/Groq? |
+| --- | --- | --- |
+| `test_booking_flow.py` | Full call -> booking via `CallHandler` with a scripted fake conversation manager; SQLite rows + mock notification content; idempotent-replay and concurrent-slot-conflict booking scenarios | No |
+| `test_slots.py` | Bug fix regression: past slots are never offered, including the exact real-call scenario that surfaced the bug | No |
+| `test_session_store.py` | Externalized session state: one store instance's write is readable by another (the multi-worker scenario), TTL expiry, opportunistic cleanup | No |
+| `test_conversation_retry.py` | Retry-with-backoff for transient Groq errors (timeout/connection/5xx) via a mocked client; confirms bounded retries, eventual fallback, and the harmony-glitch retry path is unaffected | No |
+| `test_observability.py` | Structured logging robustness, `/internal/stats` aggregation, Sentry init safety | No |
+| `test_conversation.py` | Live persona sanity check (Hindi, code-switching, out-of-scope refusal) against the real Groq API | **Yes** - skips if `GROQ_API_KEY` is missing/invalid |
 
 ## Known limitation: occasional Groq/gpt-oss-20b glitch
 
@@ -140,7 +173,14 @@ be lowered back down.
       the customer "notification" logs a short confirmation. Both are mocked
       (logged, not sent) by design for this MVP.
 - [x] Groq failures/timeouts/malformed responses never leave dead air or an
-      un-ended call.
+      un-ended call; transient failures (timeout/connection/5xx) get a
+      small bounded retry with backoff before falling back.
+- [x] A slot whose date/time has already passed is never offered or booked
+      (explicit IST-aware comparison, not a naive/local-time one).
+- [x] Conversation session state survives across separate worker processes
+      handling the same call (no more in-memory-dict-per-process).
+- [x] A retried webhook for an already-confirmed booking is a no-op, not a
+      duplicate booking or a duplicate owner/customer notification.
 - [ ] Manual-only, not automatable here: getting a Twilio trial number and
       auth token, running ngrok, and pointing the Twilio console's webhook
       at the tunnel URL (steps 2-6 above) - do this once to test a real

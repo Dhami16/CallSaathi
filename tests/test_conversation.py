@@ -10,6 +10,8 @@ Run with: venv/Scripts/python -m pytest -s tests/test_conversation.py
 import pytest
 
 from ai.conversation import FALLBACK_MESSAGE, ConversationManager
+from booking.db import init_db
+from booking.session_store import SQLiteSessionStore
 from config import load_config
 
 DEMO_BUSINESS = {
@@ -26,11 +28,13 @@ DEMO_SLOTS = [
 
 
 @pytest.fixture
-def manager():
+def manager(tmp_path):
     config = load_config()
     if not config.groq_api_key:
         pytest.skip("GROQ_API_KEY not set - see .env.example")
-    return ConversationManager(config.groq_api_key, config.groq_model)
+    db_path = str(tmp_path / "test_conversation_sessions.db")
+    init_db(db_path)
+    return ConversationManager(config.groq_api_key, config.groq_model, session_store=SQLiteSessionStore(db_path))
 
 
 def _say(manager, call_id, transcript, label):
