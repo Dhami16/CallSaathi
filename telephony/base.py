@@ -34,10 +34,13 @@ class TelephonyProvider(ABC):
         to `gather_action_url`."""
 
     @abstractmethod
-    def build_reply_response(self, reply_text: str, hangup: bool = False) -> Any:
+    def build_reply_response(self, reply_text: str, hangup: bool = False, language: str = "english") -> Any:
         """Build the response for a follow-up turn: speak `reply_text`, then
         either keep listening for more speech (hangup=False) or end the
-        call (hangup=True)."""
+        call (hangup=True). `language` sets the speech-recognition locale
+        for the next gather, same as build_greeting_response - without it,
+        every turn after the first silently falls back to the provider's
+        default locale regardless of the business's configured language."""
 
     @abstractmethod
     def build_continue_response(self, sentence_text: str, continue_url: str) -> Any:

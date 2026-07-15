@@ -72,7 +72,7 @@ class TwilioProvider(TelephonyProvider):
         response.hangup()
         return str(response)
 
-    def build_reply_response(self, reply_text: str, hangup: bool = False) -> str:
+    def build_reply_response(self, reply_text: str, hangup: bool = False, language: str = "english") -> str:
         response = VoiceResponse()
         if hangup:
             if reply_text:
@@ -80,9 +80,15 @@ class TwilioProvider(TelephonyProvider):
             response.hangup()
             return str(response)
 
+        locale = _LANGUAGE_LOCALES.get(language, _DEFAULT_LOCALE)
         # No `action` given: Twilio defaults to re-posting to the current
         # request URL, i.e. /voice/handle-input again, continuing the loop.
-        gather = Gather(input="speech", method="POST", speech_timeout="auto")
+        # `language` matters here exactly as it does for the greeting's
+        # Gather: without it, every turn after the first silently used
+        # Twilio's own default locale (en-US) regardless of the business's
+        # configured language - a real, separate bug from the prompt's
+        # language-matching wording.
+        gather = Gather(input="speech", method="POST", language=locale, speech_timeout="auto")
         # reply_text can be empty when progressive delivery already spoke
         # everything for this turn via prior <Say>+<Redirect> hits and this
         # call is just the one that confirms "nothing more, start listening".

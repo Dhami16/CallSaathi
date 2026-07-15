@@ -159,40 +159,79 @@ _CONFIRMATIONS = {
 }
 
 
+_NO_SLOTS_TEXT = "(no slots currently available - apologize and say someone will call back)"
+
+# --- Per-conversation-stage prompt templates -------------------------------
+#
+# Split out (rather than one long f-string) so each stage of the flow can be
+# read, edited, or reused independently - e.g. a future per-vertical variant
+# could swap just _REASON_GATHERING_STAGE without touching booking
+# confirmation. _build_system_prompt below assembles these into ONE final
+# prompt whose text is unchanged from before this split.
+#
+# IMPORTANT: keep the assembled result's *structure* (numbered steps,
+# explicit rules) intact when editing these - see README's latency section.
+# Collapsing this same content into flowing prose was measured to roughly
+# double gpt-oss's hidden reasoning tokens and made replies slower, not
+# shorter, despite fewer prompt tokens. That finding is about the shape of
+# the final text the model sees, not how the Python building it is
+# organized - so this refactor only changes the source layout, not the
+# prompt itself.
+
+_INTRO_STAGE = "You are a phone booking assistant for {name}, a {vertical}."
+
+_REASON_GATHERING_STAGE = "1. The greeting is already done. Ask the caller's reason for calling."
+
+_SLOT_OFFERING_STAGE = """2. Ask their preferred date/time.
+3. Offer these available slots (never invent others):
+{slot_lines}"""
+
+_CONFIRMATION_STAGE = """4. Only once the caller has clearly agreed to one specific slot AND you know
+   their real name AND reason, add a final line in EXACTLY this format
+   (never spoken aloud, always in English):
+   BOOKING_CONFIRMED: {"slot_id": <id>, "customer_name": "<name>", "reason": "<reason>"}
+   Never guess or use a placeholder for name/reason.
+5. Never add that line in your very first reply - ask reason and timing first."""
+
+_LANGUAGE_MATCHING_RULE = """- Reply in the SAME language the caller's most recent message used. If they
+  just spoke English, reply in English - do not default to Hindi. If they
+  spoke Hindi, Bengali, or a mix, mirror that same mix. Switch again
+  whenever they do."""
+
+_DECLINE_OUT_OF_SCOPE_RULE = (
+    '- Decline medical/pricing/service questions: "I can help you book an\n'
+    "  appointment, and someone from the business can answer that when they call\n"
+    '  you back."'
+)
+
+_GENERAL_RULES = """- 1-2 short sentences per reply - this is a live phone call.
+- Never invent slots, prices, or details not given here.
+- Caller's phone number is already known from caller ID - never ask for it."""
+
+
 def _build_system_prompt(business: dict, slots: list[dict]) -> str:
     if slots:
         slot_lines = "\n".join(f"- id={s['id']}: {s['date']} at {s['time']}" for s in slots[:3])
     else:
-        slot_lines = "(no slots currently available - apologize and say someone will call back)"
+        slot_lines = _NO_SLOTS_TEXT
 
-    # Measured (see README's latency section): collapsing this into flowing
-    # prose actually made completion latency WORSE, not better - gpt-oss's
-    # hidden reasoning tokens (which dominate latency) scale with how
-    # explicit/structured the prompt is, not its raw length. The numbered
-    # step structure below is deliberately kept; only redundant wording
-    # within each step/rule was trimmed.
-    return f"""You are a phone booking assistant for {business['name']}, a {business['vertical']}.
+    intro = _INTRO_STAGE.format(name=business["name"], vertical=business["vertical"])
+    flow = "\n".join(
+        [
+            _REASON_GATHERING_STAGE,
+            _SLOT_OFFERING_STAGE.format(slot_lines=slot_lines),
+            _CONFIRMATION_STAGE,
+        ]
+    )
+    rules = "\n".join([_LANGUAGE_MATCHING_RULE, _DECLINE_OUT_OF_SCOPE_RULE, _GENERAL_RULES])
+
+    return f"""{intro}
 
 Your ONLY job on this call:
-1. The greeting is already done. Ask the caller's reason for calling.
-2. Ask their preferred date/time.
-3. Offer these available slots (never invent others):
-{slot_lines}
-4. Only once the caller has clearly agreed to one specific slot AND you know
-   their real name AND reason, add a final line in EXACTLY this format
-   (never spoken aloud, always in English):
-   BOOKING_CONFIRMED: {{"slot_id": <id>, "customer_name": "<name>", "reason": "<reason>"}}
-   Never guess or use a placeholder for name/reason.
-5. Never add that line in your very first reply - ask reason and timing first.
+{flow}
 
 Rules:
-- Match whatever mix of Hindi, Bengali and English the caller uses.
-- Decline medical/pricing/service questions: "I can help you book an
-  appointment, and someone from the business can answer that when they call
-  you back."
-- 1-2 short sentences per reply - this is a live phone call.
-- Never invent slots, prices, or details not given here.
-- Caller's phone number is already known from caller ID - never ask for it.
+{rules}
 """
 
 

@@ -109,7 +109,8 @@ class CallHandler:
                 self._write_turn(
                     call_id, turn_number=turn_number, turn_start=turn_start, transcript_in="", response_out=_REPEAT_MESSAGE
                 )
-                return self.telephony.build_reply_response(_REPEAT_MESSAGE, hangup=False)
+                language = call_meta["business"].get("language_pref", "english") if call_meta is not None else "english"
+                return self.telephony.build_reply_response(_REPEAT_MESSAGE, hangup=False, language=language)
 
             logger.info(
                 "stage", stage="speech_captured", outcome="success", transcript_length=len(transcript)
@@ -211,7 +212,9 @@ class CallHandler:
             continue_url = f"{continue_url_base}?idx={next_sentence_index}"
             return self.telephony.build_continue_response(sentence, continue_url)
 
-        return self.telephony.build_reply_response(sentence or "", hangup=result["hangup"])
+        call_meta = self._calls.get(call_id)
+        language = call_meta["business"].get("language_pref", "english") if call_meta is not None else "english"
+        return self.telephony.build_reply_response(sentence or "", hangup=result["hangup"], language=language)
 
     def _finalize_booking(self, call_id: str, caller_number: str, booking: dict) -> bool:
         call_meta = self._calls.get(call_id)

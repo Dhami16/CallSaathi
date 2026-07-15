@@ -27,8 +27,8 @@ class FakeTelephonyProvider(TelephonyProvider):
     def build_greeting_response(self, greeting_text, gather_action_url, language="english"):
         return {"type": "greeting", "text": greeting_text}
 
-    def build_reply_response(self, reply_text, hangup=False):
-        return {"type": "reply", "text": reply_text, "hangup": hangup}
+    def build_reply_response(self, reply_text, hangup=False, language="english"):
+        return {"type": "reply", "text": reply_text, "hangup": hangup, "language": language}
 
     def build_continue_response(self, sentence_text, continue_url):
         return {"type": "continue", "text": sentence_text, "continue_url": continue_url}
