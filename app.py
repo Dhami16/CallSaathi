@@ -72,7 +72,25 @@ def voice_handle_input():
         )
         return Response(status=403)
 
-    twiml = get_call_handler().handle_speech_input(dict(request.form))
+    continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
+    twiml = get_call_handler().handle_speech_input(dict(request.form), continue_url_base)
+    return Response(twiml, mimetype="text/xml")
+
+
+@app.post("/voice/continue")
+def voice_continue():
+    """Hit by Twilio's <Redirect> mid-turn, while a streamed LLM response is
+    still being progressively delivered sentence by sentence - see
+    ai/conversation.py's start_streaming_reply/get_next_streamed_sentence."""
+    if not _signature_valid():
+        logger.warning(
+            "stage", stage="telephony_webhook_received", outcome="error", reason="invalid_signature", route="/voice/continue"
+        )
+        return Response(status=403)
+
+    sentence_index = int(request.args.get("idx", 0))
+    continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
+    twiml = get_call_handler().handle_continue(dict(request.form), continue_url_base, sentence_index)
     return Response(twiml, mimetype="text/xml")
 
 

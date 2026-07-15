@@ -10,7 +10,10 @@ with the full call transcript.
 - Answers an inbound call forwarded to a Twilio number (`POST /voice`).
 - Greets the caller, asks their reason for calling and preferred time, offers
   up to 3 open slots, and books one once the caller agrees and gives their
-  name (`POST /voice/handle-input`, looped via Twilio's `<Gather>`).
+  name (`POST /voice/handle-input`, looped via Twilio's `<Gather>`). Replies
+  are streamed from Groq and delivered sentence by sentence as they're
+  generated (`POST /voice/continue`, driven by TwiML `<Redirect>`) rather
+  than waiting for the whole response - see "Progressive delivery" below.
 - Persists the booking, the booked slot, and the **full** call transcript to
   SQLite.
 - "Notifies" the business owner (full transcript + booking details) and the
@@ -25,7 +28,9 @@ telephony/            Provider-agnostic interface (TelephonyProvider) +
                        import Twilio-specific types.
 ai/conversation.py     Groq-backed dialogue manager: session state lives in
                        booking/session_store.py (not in-memory), booking
-                       confirmation via a text marker, retry + error fallback.
+                       confirmation via a text marker, retry + error fallback,
+                       sentence-by-sentence streamed delivery (SentenceStreamer,
+                       start_streaming_reply/get_next_streamed_sentence).
 booking/db.py          SQLite schema.
 booking/repository.py  Data access: businesses, slots (future-only, IST-aware),
                        bookings (idempotent per call_id), call_logs, call_turns.
@@ -133,6 +138,7 @@ venv\Scripts\python -m pytest -s tests/test_conversation.py      # needs a real 
 | `test_session_store.py` | Externalized session state: one store instance's write is readable by another (the multi-worker scenario), TTL expiry, opportunistic cleanup | No |
 | `test_conversation_retry.py` | Retry-with-backoff for transient Groq errors (timeout/connection/5xx) via a mocked client; confirms bounded retries, eventual fallback, and the harmony-glitch retry path is unaffected | No |
 | `test_observability.py` | Structured logging robustness, `/internal/stats` aggregation, Sentry init safety | No |
+| `test_streaming.py` | Progressive delivery: `SentenceStreamer` boundary/marker-suppression logic, multi- and single-sentence replies delivered correctly via a mocked streaming client, the next-sentence timeout/fallback path | No |
 | `test_conversation.py` | Live persona sanity check (Hindi, code-switching, out-of-scope refusal) against the real Groq API | **Yes** - skips if `GROQ_API_KEY` is missing/invalid |
 
 ## Known limitation: occasional Groq/gpt-oss-20b glitch
@@ -160,6 +166,92 @@ normally; a small fraction end early with the graceful fallback instead of
 a booking. If Groq patches this server-side, `MAX_GROQ_ATTEMPTS` can likely
 be lowered back down.
 
+A related, separate quirk measured during the streaming work (Task 3 of
+the performance session): for the specific booking-confirmation turn
+(caller has just agreed to a slot and given their name), Groq occasionally
+returns **completely empty content** with `finish_reason='stop'` and no
+exception at all - measured at roughly 15-20% of attempts in a 20-call
+batch, in **both** streaming and non-streaming modes at a similar rate, so
+this isn't something progressive delivery introduced. The existing
+empty-content fallback (`ai/conversation.py`) already handles it correctly
+- graceful message, logged, Sentry-reported - but the rate is worth knowing
+if booking-turn fallbacks seem more frequent than other turns.
+
+## Progressive (sentence-by-sentence) delivery
+
+Twilio's TwiML model only allows one complete document per webhook hit, so
+"streaming" here means: `ai/conversation.py` runs the Groq call with
+`stream=True` in a background thread, extracts sentences as they complete
+(`SentenceStreamer`), and writes them to the same session store used for
+conversation state (a `stream:<call_id>` key, not a separate mechanism).
+Each TwiML response speaks one sentence and `<Redirect>`s to
+`POST /voice/continue?idx=N`, which fetches the next one - so the caller
+starts hearing the reply before the model has finished generating all of
+it, rather than waiting for the complete response.
+
+Two deliberate trade-offs, made after finding real bugs while testing this:
+
+- **No artificial lag between sentences.** An earlier design held each
+  sentence back by one step so a `BOOKING_CONFIRMED` marker appearing right
+  after it could suppress it before it was ever spoken. Measured effect:
+  it meant the *last two* sentences of every reply - which, for this app's
+  prompt-mandated 1-2 sentence replies, is *all of them* - never got
+  delivered progressively at all, defeating the point for the common case.
+  The shipped version releases each sentence immediately. The real,
+  accepted residual risk: if the model ever precedes a booking-confirming
+  marker with more than a token or two of spoken lead-in, that lead-in may
+  already have been spoken in addition to the deterministic confirmation
+  template. In testing, marker turns had zero leading spoken text, so this
+  hasn't been observed - but it's a possible minor redundancy, not a
+  correctness bug (the booking itself, and the database records, are
+  unaffected either way).
+- **Only the very first part of a stream retries on failure.** The
+  existing harmony-glitch and transient-error retries (Task 4 of the
+  reliability session) apply to getting the stream started and its first
+  content; a failure *mid-stream*, after the caller may already have heard
+  some sentences, is treated as final for that turn (falls back
+  gracefully) rather than restarting the whole generation, since a restart
+  would produce new content that might not follow on from what was already
+  spoken.
+
+Known, out-of-scope limitation carried over from before this session,
+inherited rather than introduced: `call_handler.py`'s own `_calls` dict
+(business/turn-number bookkeeping, distinct from the externalized
+conversation session) is still an in-memory, per-process dict. Under more
+than one gunicorn worker, a `/voice/continue` hit landing on a different
+worker than the one that started the turn wouldn't find it. This is the
+same class of bug the reliability session fixed for conversation history,
+but that fix didn't extend to this dict; out of scope to fix in this
+latency-only session.
+
+## Latency notes (from the performance session)
+
+Real `call_turns` data (small sample - 3 calls, 10 LLM turns) showed nearly
+all controllable latency is the Groq call itself (non-LLM overhead per turn
+was ~0-1ms in almost every turn). Two things worth knowing before touching
+`ai/conversation.py`'s prompt or generation params again:
+
+- **`max_tokens=600` is not the bottleneck and should not be lowered.**
+  Measured completion_tokens on successful turns typically land around
+  60-150 (`finish_reason='stop'`, well under the cap) - the model stops
+  itself long before hitting 600. Earlier testing (MVP session) showed real
+  truncation/empty-content failures at lower caps (200-400), so the margin
+  is deliberate, not slack.
+- **A shorter prompt is not automatically a faster one for this model.**
+  Collapsing the system prompt's explicit numbered steps into flowing
+  prose was tried and measured (interleaved A/B trials against the
+  original, controlling for Groq's own time-varying load): it *increased*
+  median completion tokens roughly 2x and made latency worse, despite
+  having fewer prompt tokens. `openai/gpt-oss-20b`'s hidden reasoning
+  tokens (which dominate latency, per `reasoning_format="hidden"`) appear
+  to scale with how explicit/structured the prompt is, not its raw length -
+  a numbered step-by-step scaffold seems to reduce how much the model
+  needs to reason out the flow itself. The shipped prompt keeps that
+  numbered structure and only trims genuinely redundant wording (1643 ->
+  1181 chars), which measured as a real, modest improvement (~14% lower
+  median latency, ~30% fewer completion tokens in testing) rather than a
+  regression.
+
 ## What "done" looks like for this MVP
 
 - [x] `/health`, `/voice`, `/voice/handle-input` all work behind the Twilio
@@ -185,6 +277,63 @@ be lowered back down.
       auth token, running ngrok, and pointing the Twilio console's webhook
       at the tunnel URL (steps 2-6 above) - do this once to test a real
       live call end-to-end.
+- [x] Replies are delivered sentence-by-sentence as Groq streams them,
+      instead of the caller waiting for the entire response.
 - Explicitly **not** built (see product spec): owner dashboard, calendar
   sync, payments, multi-location/staff routing, outbound calling, real
   WhatsApp/SMS sending.
+
+## Task 4 research: Twilio Media Streams (not implemented - recommendation only)
+
+Investigated moving from the current TwiML request/response model (Twilio's
+built-in `<Gather>` STT + `<Say>` TTS) to Twilio Media Streams: a
+WebSocket carrying raw bidirectional audio, paired with a real-time
+streaming STT (e.g. Deepgram) and streaming TTS (e.g. ElevenLabs, Deepgram
+Aura, Cartesia).
+
+**Scope of the change: closer to a rewrite of the telephony/audio layer
+than an addition.** `TelephonyProvider`'s whole interface
+(`parse_incoming_call`, `build_reply_response`, etc.) is built around "one
+webhook in, one TwiML document out" - Media Streams is a long-lived
+WebSocket carrying raw audio frames and JSON control events, a fundamentally
+different shape that doesn't fit that interface at all. It would need a new,
+parallel interface, and Flask's synchronous WSGI model isn't a natural fit
+for a long-lived low-latency bidirectional stream - this would likely need
+a different server (ASGI, or a dedicated WebSocket process alongside the
+existing Flask app). The AI/booking "brain" (Groq prompt, marker parsing,
+database schema, notifications) would mostly carry over; the telephony
+transport, STT, and TTS layers would not.
+
+**Cost**: today's per-minute Twilio voice pricing bundles STT (`<Gather>`)
+and TTS (`<Say>`) in. Media Streams typically carries its own additional
+per-minute fee on top of base voice minutes, plus separate, additional
+bills from a real-time STT vendor and a real-time TTS vendor (premium
+conversational TTS providers like ElevenLabs are typically priced well
+above Twilio's bundled Polly voices). Net effect: more vendor
+relationships to manage, and very likely a higher total per-minute cost -
+get current quotes from specific vendors before deciding, since that's
+where the real number lives, not a per-minute estimate here.
+
+**Realistic latency upside on top of Tasks 2/3**: Task 1's real data showed
+the Groq call itself is the dominant cost (hundreds of ms to a few
+seconds), not telephony transport - and Tasks 2/3 already address that
+directly (tighter prompt, progressive sentence delivery). Media Streams
+would mainly shave latency at the edges: skipping the wait for Twilio's
+Gather to finalize a transcript before POSTing to us, and removing the
+`<Redirect>` HTTP round-trip between sentences (each measured at roughly
+50-100ms in this session's live demo). It would also enable real barge-in
+(the caller interrupting the agent mid-sentence), which is a genuinely new
+capability TwiML can't do at all, not just a latency win. But as long as
+the LLM call remains the dominant cost, the latency upside here is
+incremental, not transformative.
+
+**Recommendation: defer.** Two-person team, pilot stage, no paying
+businesses onboarded yet. This would mean a substantial rewrite of the
+telephony layer, two new paid vendor relationships, and re-validating
+voice/transcription quality for Hindi/Bengali/English code-switching
+against providers that haven't been tested for that - all to chase a
+latency win that's likely secondary to what's already been captured from
+the actual measured bottleneck. Revisit once there's real evidence (caller
+complaints, measured drop-off correlating with latency, or a concrete want
+for barge-in as a feature) that specifically implicates the TwiML
+transport model rather than the LLM call.

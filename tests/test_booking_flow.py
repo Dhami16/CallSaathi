@@ -30,10 +30,14 @@ class FakeTelephonyProvider(TelephonyProvider):
     def build_reply_response(self, reply_text, hangup=False):
         return {"type": "reply", "text": reply_text, "hangup": hangup}
 
+    def build_continue_response(self, sentence_text, continue_url):
+        return {"type": "continue", "text": sentence_text, "continue_url": continue_url}
+
 
 class FakeConversationManager:
     """Scripted stand-in for ai.conversation.ConversationManager: greets,
-    then confirms a booking on the very next turn - no LLM call involved."""
+    then confirms a booking on the very next turn in a single (non-streamed)
+    sentence - no LLM call involved."""
 
     def __init__(self):
         self.sessions = {}
@@ -42,10 +46,11 @@ class FakeConversationManager:
         self.sessions[call_id] = {"slots": {s["id"]: s for s in slots}}
         return f"Hello! You've reached {business['name']}."
 
-    def get_reply(self, call_id, transcript):
+    def start_streaming_reply(self, call_id, transcript):
         slot = next(iter(self.sessions[call_id]["slots"].values()))
         return {
-            "reply_text": f"Booked for {slot['date']} at {slot['time']}!",
+            "sentence": f"Booked for {slot['date']} at {slot['time']}!",
+            "more_coming": False,
             "hangup": True,
             "booking": {
                 "slot_id": slot["id"],
@@ -55,6 +60,9 @@ class FakeConversationManager:
                 "reason": "skin consultation",
             },
         }
+
+    def get_next_streamed_sentence(self, call_id, sentence_index):
+        raise AssertionError("not expected to be called - this fake never sets more_coming=True")
 
     def get_transcript(self, call_id):
         return "Caller: Mujhe ek appointment chahiye\nAgent: Booked for the slot!"
@@ -105,7 +113,7 @@ def test_full_call_creates_booking_and_notifications(db_path, capsys):
     print("Greeting:", greeting)
 
     speech_data = {**call_data, "transcript": "Mujhe kal appointment chahiye", "confidence": 0.9}
-    reply = handler.handle_speech_input(speech_data)
+    reply = handler.handle_speech_input(speech_data, continue_url_base="http://test/voice/continue")
     print("Reply:", reply)
 
     # structlog's PrintLoggerFactory writes straight to stdout rather than

@@ -76,7 +76,12 @@ class CallHandler:
                 greeting, gather_action_url, business.get("language_pref", "english")
             )
 
-    def handle_speech_input(self, raw_request_data: dict) -> str:
+    def handle_speech_input(self, raw_request_data: dict, continue_url_base: str) -> str:
+        """First webhook hit of a turn. Kicks off progressive (sentence-by-
+        sentence) delivery and returns as soon as the first thing to say is
+        ready - see ai/conversation.py's start_streaming_reply. Subsequent
+        sentences of THIS SAME turn are fetched via handle_continue, driven
+        by Twilio's <Redirect>."""
         turn_start = time.monotonic()
         speech = self.telephony.parse_speech_result(raw_request_data)
         call_id = speech["call_id"]
@@ -110,53 +115,103 @@ class CallHandler:
                 "stage", stage="speech_captured", outcome="success", transcript_length=len(transcript)
             )
 
-            llm_start = time.monotonic()
-            result = self.conversation.get_reply(call_id, transcript)
-            llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
+            result = self.conversation.start_streaming_reply(call_id, transcript)
 
-            is_fallback = (
-                result["reply_text"] == FALLBACK_MESSAGE and result["hangup"] and result["booking"] is None
-            )
-            # ai/conversation.py already logs its own specific reason (Groq
-            # failure, max turns, malformed marker, ...) and reports the
-            # ones that end the call to Sentry itself - this is just the
-            # orchestration-level view of the same outcome.
-            logger.info(
-                "stage",
-                stage="ai_response_generated",
-                outcome="fallback_triggered" if is_fallback else "success",
-                hangup=result["hangup"],
-                has_booking=bool(result["booking"]),
-            )
-
-            reply_text = result["reply_text"]
-
-            if result["booking"]:
-                logger.info("stage", stage="booking_attempted", slot_id=result["booking"]["slot_id"])
-                booked = self._finalize_booking(call_id, speech["caller_number"], result["booking"])
-                if not booked:
-                    reply_text = _SLOT_TAKEN_MESSAGE
-            elif is_fallback and call_meta is not None:
-                # The AI layer gave up (Groq down/glitched/exhausted retries)
-                # and the call is ending without a booking. Persist this so
-                # /internal/stats can count it, not just Sentry.
-                self._log_non_booking_outcome(call_id, call_meta["business"], speech["caller_number"], "fallback")
-
-            if result["hangup"]:
-                logger.info("stage", stage="call_ended", outcome="fallback_triggered" if is_fallback else "success")
-                self.conversation.end_session(call_id)
-                self._calls.pop(call_id, None)
-
-            self._write_turn(
+            return self._process_streaming_result(
                 call_id,
-                turn_number=turn_number,
-                turn_start=turn_start,
-                llm_latency_ms=llm_latency_ms,
-                transcript_in=transcript,
-                response_out=reply_text,
+                speech["caller_number"],
+                turn_number,
+                turn_start,
+                transcript,
+                result,
+                next_sentence_index=1,
+                continue_url_base=continue_url_base,
             )
 
-            return self.telephony.build_reply_response(reply_text, hangup=result["hangup"])
+    def handle_continue(self, raw_request_data: dict, continue_url_base: str, sentence_index: int) -> str:
+        """Handles a <Redirect> hit fetching the next sentence of a turn
+        already started by handle_speech_input. `sentence_index` is carried
+        in the redirect URL's query string since each hit is a fresh,
+        possibly different-process request with no memory of its own."""
+        turn_start = time.monotonic()
+        call = self.telephony.parse_incoming_call(raw_request_data)
+        call_id = call["call_id"]
+
+        with structlog.contextvars.bound_contextvars(call_id=call_id):
+            sentry_sdk.set_tag("call_id", call_id)
+            call_meta = self._calls.get(call_id)
+            turn_number = call_meta["turn_number"] if call_meta is not None else None
+            if call_meta is not None:
+                sentry_sdk.set_tag("business_id", call_meta["business"]["id"])
+
+            result = self.conversation.get_next_streamed_sentence(call_id, sentence_index)
+
+            return self._process_streaming_result(
+                call_id,
+                call["caller_number"],
+                turn_number,
+                turn_start,
+                transcript_in=None,
+                result=result,
+                next_sentence_index=sentence_index + 1,
+                continue_url_base=continue_url_base,
+            )
+
+    def _process_streaming_result(
+        self,
+        call_id: str,
+        caller_number: str,
+        turn_number: int | None,
+        turn_start: float,
+        transcript_in: str | None,
+        result: dict,
+        next_sentence_index: int,
+        continue_url_base: str,
+    ) -> str:
+        sentence = result["sentence"]
+        is_fallback = sentence == FALLBACK_MESSAGE and result["hangup"] and result["booking"] is None
+
+        logger.info(
+            "stage",
+            stage="ai_response_generated",
+            outcome="fallback_triggered" if is_fallback else "success",
+            hangup=result["hangup"],
+            has_booking=bool(result["booking"]),
+            more_coming=result["more_coming"],
+        )
+
+        if result["booking"]:
+            logger.info("stage", stage="booking_attempted", slot_id=result["booking"]["slot_id"])
+            booked = self._finalize_booking(call_id, caller_number, result["booking"])
+            if not booked:
+                sentence = _SLOT_TAKEN_MESSAGE
+        elif is_fallback:
+            call_meta = self._calls.get(call_id)
+            if call_meta is not None:
+                # The AI layer gave up (Groq down/glitched/timed out
+                # mid-stream) and the call is ending without a booking.
+                # Persist this so /internal/stats can count it, not just Sentry.
+                self._log_non_booking_outcome(call_id, call_meta["business"], caller_number, "fallback")
+
+        if result["hangup"]:
+            logger.info("stage", stage="call_ended", outcome="fallback_triggered" if is_fallback else "success")
+            self.conversation.end_session(call_id)
+            self._calls.pop(call_id, None)
+
+        self._write_turn(
+            call_id,
+            turn_number=turn_number,
+            turn_start=turn_start,
+            llm_latency_ms=int((time.monotonic() - turn_start) * 1000),
+            transcript_in=transcript_in,
+            response_out=sentence,
+        )
+
+        if result["more_coming"]:
+            continue_url = f"{continue_url_base}?idx={next_sentence_index}"
+            return self.telephony.build_continue_response(sentence, continue_url)
+
+        return self.telephony.build_reply_response(sentence or "", hangup=result["hangup"])
 
     def _finalize_booking(self, call_id: str, caller_number: str, booking: dict) -> bool:
         call_meta = self._calls.get(call_id)

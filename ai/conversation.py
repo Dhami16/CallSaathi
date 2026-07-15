@@ -19,6 +19,7 @@ ever touching the database.
 """
 import json
 import re
+import threading
 import time
 
 import structlog
@@ -59,11 +60,86 @@ _PLACEHOLDER_TOKENS = {"unknown", "n/a", "na", "customer", "caller", "name", ""}
 # inline after other spoken text on the same line rather than on its own
 # line, despite the prompt asking for "a final line".
 _BOOKING_MARKER_RE = re.compile(r"BOOKING_CONFIRMED:\s*(\{[^{}]*\})")
+_BOOKING_MARKER_TRIGGER = "BOOKING_CONFIRMED:"
+
+# Progressive delivery (see SentenceStreamer / start_streaming_reply below):
+# how long the FIRST webhook hit for a turn will wait for the first sentence
+# (generous - covers the same retries get_reply() would do), and how long a
+# later /voice/continue hit will wait for the NEXT sentence (short - by then
+# the stream is already flowing, so a real gap here means something's wrong,
+# not just normal generation time).
+STREAM_FIRST_SENTENCE_TIMEOUT_SECONDS = 8.0
+STREAM_NEXT_SENTENCE_TIMEOUT_SECONDS = 4.0
+STREAM_POLL_INTERVAL_SECONDS = 0.15
 
 
 def _is_harmony_tool_glitch(error: BadRequestError) -> bool:
     body = error.body if isinstance(error.body, dict) else {}
     return (body.get("error") or {}).get("code") == "tool_use_failed"
+
+
+class SentenceStreamer:
+    """Detects sentence boundaries in a token stream, releasing each
+    sentence as soon as it's complete (i.e. as soon as sentence-ending
+    punctuation is followed by whitespace in the buffer).
+
+    Known, accepted limitation: a BOOKING_CONFIRMED marker is only detected
+    once its own text starts appearing in the buffer. Any sentence that
+    completed and was already released in an *earlier* feed() call cannot
+    be un-released - so if the model ever precedes the marker with more
+    than a token or two of spoken lead-in, that lead-in may already have
+    been spoken by the time the marker is recognized, in addition to the
+    deterministic confirmation _handle_booking_marker produces. In testing
+    with the current prompt, marker turns had zero leading spoken text, so
+    this hasn't been observed in practice - but it's a real trade-off, not
+    an oversight: an earlier design held back one sentence at a time to
+    close this gap, but that meant the last two sentences of EVERY reply
+    (not just booking-confirming ones) were never released progressively,
+    which defeated the point for this app's typical 1-2 sentence replies.
+    Delivering promptly was chosen over perfect marker-adjacency safety.
+    """
+
+    _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+    def __init__(self):
+        self._buffer = ""
+        self.marker_seen = False
+
+    def feed(self, delta: str) -> list[str]:
+        """Feed a chunk of newly streamed text. Returns any sentences now
+        safe to release for delivery (may be empty)."""
+        if self.marker_seen or not delta:
+            return []
+
+        self._buffer += delta
+
+        if _BOOKING_MARKER_TRIGGER in self._buffer:
+            # Never release anything still buffered once the marker starts
+            # appearing - see the class docstring for what this does and
+            # doesn't protect against.
+            self.marker_seen = True
+            self._buffer = ""
+            return []
+
+        released = []
+        parts = self._SENTENCE_END_RE.split(self._buffer)
+        if len(parts) > 1:
+            for complete in parts[:-1]:
+                complete = complete.strip()
+                if complete:
+                    released.append(complete)
+            self._buffer = parts[-1]
+        return released
+
+    def finish(self) -> list[str]:
+        """Call once the stream has ended. Returns the final sentence, if
+        any is still buffered (it never had trailing whitespace to signal
+        its own completion) - empty if a marker was seen."""
+        if self.marker_seen:
+            return []
+        tail = self._buffer.strip()
+        self._buffer = ""
+        return [tail] if tail else []
 
 
 # Greetings/confirmations are romanized (Hinglish/Benglish) rather than
@@ -89,6 +165,12 @@ def _build_system_prompt(business: dict, slots: list[dict]) -> str:
     else:
         slot_lines = "(no slots currently available - apologize and say someone will call back)"
 
+    # Measured (see README's latency section): collapsing this into flowing
+    # prose actually made completion latency WORSE, not better - gpt-oss's
+    # hidden reasoning tokens (which dominate latency) scale with how
+    # explicit/structured the prompt is, not its raw length. The numbered
+    # step structure below is deliberately kept; only redundant wording
+    # within each step/rule was trimmed.
     return f"""You are a phone booking assistant for {business['name']}, a {business['vertical']}.
 
 Your ONLY job on this call:
@@ -97,23 +179,20 @@ Your ONLY job on this call:
 3. Offer these available slots (never invent others):
 {slot_lines}
 4. Only once the caller has clearly agreed to one specific slot AND you know
-   their real name AND the reason for the visit, add a final line to your
-   reply in EXACTLY this format (the caller never hears this line, so write
-   it in plain English regardless of the conversation's language):
+   their real name AND reason, add a final line in EXACTLY this format
+   (never spoken aloud, always in English):
    BOOKING_CONFIRMED: {{"slot_id": <id>, "customer_name": "<name>", "reason": "<reason>"}}
-   Do not add this line until all three pieces of information are genuinely
-   known from what the caller told you - never guess or use a placeholder.
-5. Do not add the BOOKING_CONFIRMED line in the same reply as your very
-   first response to the caller - you need at least one full exchange
-   (reason, then timing) before a booking can be legitimate.
+   Never guess or use a placeholder for name/reason.
+5. Never add that line in your very first reply - ask reason and timing first.
 
 Rules:
-- Speak in whatever mix of Hindi, Bengali and English the caller uses. Match their language naturally.
-- Never answer medical advice, pricing, or service-specific questions. If asked, say something like:
-  "I can help you book an appointment, and someone from the business can answer that when they call you back."
-- Keep every spoken reply to 1-2 short sentences. This is a live phone call, not a chat.
-- Never make up slots, prices, or business details not given to you here.
-- The caller's phone number is already known from caller ID - never ask for it.
+- Match whatever mix of Hindi, Bengali and English the caller uses.
+- Decline medical/pricing/service questions: "I can help you book an
+  appointment, and someone from the business can answer that when they call
+  you back."
+- 1-2 short sentences per reply - this is a live phone call.
+- Never invent slots, prices, or details not given here.
+- Caller's phone number is already known from caller ID - never ask for it.
 """
 
 
@@ -124,6 +203,9 @@ class ConversationManager:
         model: str = "openai/gpt-oss-20b",
         session_store: SessionStore = None,
         session_ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        stream_first_sentence_timeout_seconds: float = STREAM_FIRST_SENTENCE_TIMEOUT_SECONDS,
+        stream_next_sentence_timeout_seconds: float = STREAM_NEXT_SENTENCE_TIMEOUT_SECONDS,
+        stream_poll_interval_seconds: float = STREAM_POLL_INTERVAL_SECONDS,
     ):
         self._client = Groq(api_key=api_key, timeout=REQUEST_TIMEOUT_SECONDS)
         self._model = model
@@ -131,6 +213,12 @@ class ConversationManager:
             raise ValueError("session_store is required (see booking/session_store.py)")
         self._store = session_store
         self._session_ttl_seconds = session_ttl_seconds
+        # Overridable (rather than always using the module constants
+        # directly) so tests can use short timeouts instead of waiting the
+        # real several-second production values.
+        self._stream_first_timeout = stream_first_sentence_timeout_seconds
+        self._stream_next_timeout = stream_next_sentence_timeout_seconds
+        self._stream_poll_interval = stream_poll_interval_seconds
 
     def start_session(self, call_id: str, business: dict, slots: list[dict]) -> str:
         """Seeds conversation state and returns a template greeting (no LLM
@@ -243,6 +331,252 @@ class ConversationManager:
             reasoning_format="hidden",
         )
 
+    # --- Progressive (sentence-level streaming) delivery ------------------
+    #
+    # Twilio's TwiML model only lets us return one complete document per
+    # webhook hit, so "streaming" here means: run the Groq call with
+    # stream=True in a background thread, extract sentences as they
+    # complete, and let each subsequent /voice/continue hit (triggered by
+    # a <Redirect> in the previous response) pick up the next one from the
+    # shared session store. This reuses the exact same store as
+    # conversation session state (see booking/session_store.py) rather than
+    # a separate mechanism, and reuses _handle_booking_marker (unchanged)
+    # for the actual booking-confirmation decision once the full text is
+    # assembled - streaming only changes how the text is produced and
+    # delivered, never how it's validated or turned into conversation
+    # history/bookings.
+
+    def _stream_key(self, call_id: str) -> str:
+        return f"stream:{call_id}"
+
+    def start_streaming_reply(self, call_id: str, transcript: str) -> dict:
+        """Starts a streaming turn in a background thread and returns as
+        soon as the first thing to say is ready. Returns
+        {"sentence": str | None, "more_coming": bool, "hangup": bool,
+        "booking": dict | None}. If more_coming is True, the caller should
+        speak `sentence` and redirect to a /voice/continue-style endpoint
+        for sentence_index=1, then 2, etc., via get_next_streamed_sentence."""
+        session = self._store.get(call_id)
+        if session is None:
+            logger.error("stage", stage="ai_response_generated", outcome="error", reason="unknown_call_id")
+            return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+        session["turns"] += 1
+        if session["turns"] > MAX_TURNS:
+            logger.warning(
+                "stage", stage="ai_response_generated", outcome="fallback_triggered", reason="max_turns_exceeded"
+            )
+            capture_fallback("max_turns_exceeded", call_id=call_id)
+            return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+        session["messages"].append({"role": "user", "content": transcript})
+        turn_number = session["turns"]
+        self._store.set(call_id, session, self._session_ttl_seconds)
+
+        stream_key = self._stream_key(call_id)
+        self._store.set(
+            stream_key,
+            {"turn_number": turn_number, "sentences": [], "done": False, "finalized": None},
+            self._session_ttl_seconds,
+        )
+
+        thread = threading.Thread(target=self._run_stream_worker, args=(call_id, turn_number), daemon=True)
+        thread.start()
+
+        return self._consume_sentence(call_id, turn_number, sentence_index=0, timeout=self._stream_first_timeout)
+
+    def get_next_streamed_sentence(self, call_id: str, sentence_index: int) -> dict:
+        """Called for each /voice/continue hit. Returns the same shape as
+        start_streaming_reply, for sentence number `sentence_index` of the
+        call's currently in-progress turn."""
+        state = self._store.get(self._stream_key(call_id))
+        if state is None:
+            logger.error("stage", stage="ai_response_generated", outcome="error", reason="unknown_streaming_turn")
+            capture_fallback("unknown_streaming_turn", call_id=call_id)
+            return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+        return self._consume_sentence(
+            call_id, state["turn_number"], sentence_index, timeout=self._stream_next_timeout
+        )
+
+    def _consume_sentence(self, call_id: str, turn_number: int, sentence_index: int, timeout: float) -> dict:
+        stream_key = self._stream_key(call_id)
+        deadline = time.time() + timeout
+
+        while True:
+            state = self._store.get(stream_key)
+            if state is None or state["turn_number"] != turn_number:
+                logger.warning(
+                    "stage", stage="ai_response_generated", outcome="error", reason="streaming_state_lost"
+                )
+                capture_fallback("streaming_state_lost", call_id=call_id)
+                return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+            sentences = state["sentences"]
+            if len(sentences) > sentence_index:
+                sentence = sentences[sentence_index]
+                finalized = state.get("finalized")
+                has_extra = finalized is not None and finalized.get("reply_text")
+                is_last_ever = state["done"] and len(sentences) == sentence_index + 1
+                if is_last_ever and not has_extra:
+                    hangup = finalized["hangup"] if finalized else False
+                    booking = finalized.get("booking") if finalized else None
+                    return {"sentence": sentence, "more_coming": False, "hangup": hangup, "booking": booking}
+                return {"sentence": sentence, "more_coming": True, "hangup": False, "booking": None}
+
+            if state["done"]:
+                finalized = state.get("finalized") or {"reply_text": None, "hangup": False, "booking": None}
+                if finalized.get("reply_text"):
+                    return {
+                        "sentence": finalized["reply_text"],
+                        "more_coming": False,
+                        "hangup": finalized["hangup"],
+                        "booking": finalized.get("booking"),
+                    }
+                # Fully delivered via progressive sentences already, nothing extra to add.
+                return {"sentence": None, "more_coming": False, "hangup": False, "booking": None}
+
+            if time.time() >= deadline:
+                # LLM hasn't produced the next sentence yet and we've waited
+                # a sane amount of time - never error out, fall back
+                # gracefully exactly like a Groq API failure would.
+                logger.warning(
+                    "stage", stage="ai_response_generated", outcome="fallback_triggered", reason="streaming_timeout"
+                )
+                capture_fallback("streaming_reply_timeout", call_id=call_id)
+                return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+            time.sleep(self._stream_poll_interval)
+
+    @retry(
+        retry=retry_if_exception_type(_RETRYABLE_TRANSIENT_ERRORS),
+        stop=stop_after_attempt(TRANSIENT_RETRY_ATTEMPTS),
+        wait=wait_exponential(multiplier=0.5, max=2),
+        reraise=True,
+    )
+    def _call_groq_stream(self, messages: list[dict]):
+        return self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=600,
+            reasoning_format="hidden",
+            stream=True,
+        )
+
+    def _run_stream_worker(self, call_id: str, turn_number: int) -> None:
+        """Runs in a background thread, started by start_streaming_reply.
+        Streams the Groq completion, writing sentences to the shared
+        session store as they complete so /voice/continue hits (which may
+        land on a different worker process) can pick them up. The harmony-
+        glitch retry loop mirrors get_reply()'s exactly - only genuinely
+        transient errors (via _call_groq_stream's own tenacity retry) and
+        the harmony glitch are retried, and only before any content has
+        been produced; a failure mid-stream (after some sentences may
+        already be queued) is treated as final for this turn rather than
+        restarted, since restarting would regenerate content the caller may
+        have already partially heard.
+        """
+        stream_key = self._stream_key(call_id)
+
+        stream = None
+        for attempt in range(1, MAX_GROQ_ATTEMPTS + 1):
+            session = self._store.get(call_id)
+            if session is None or session["turns"] != turn_number:
+                return  # turn no longer current (call ended/moved on) - nothing to do
+            try:
+                stream = self._call_groq_stream(session["messages"])
+                break
+            except BadRequestError as e:
+                if _is_harmony_tool_glitch(e) and attempt < MAX_GROQ_ATTEMPTS:
+                    logger.warning(
+                        "stage",
+                        stage="ai_response_generated",
+                        outcome="retry",
+                        reason="groq_harmony_tool_glitch",
+                        attempt=attempt,
+                        max_attempts=MAX_GROQ_ATTEMPTS,
+                    )
+                    continue
+                logger.exception("stage", stage="ai_response_generated", outcome="error", reason="groq_api_call_failed")
+                capture_fallback("groq_api_call_failed", call_id=call_id)
+                self._finish_stream_with_fallback(stream_key, turn_number)
+                return
+            except Exception:
+                logger.exception("stage", stage="ai_response_generated", outcome="error", reason="groq_api_call_failed")
+                capture_fallback("groq_api_call_failed", call_id=call_id)
+                self._finish_stream_with_fallback(stream_key, turn_number)
+                return
+
+        if stream is None:
+            self._finish_stream_with_fallback(stream_key, turn_number)
+            return
+
+        streamer = SentenceStreamer()
+        full_text = ""
+        try:
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_text += delta
+                newly_released = streamer.feed(delta)
+                if newly_released:
+                    self._append_sentences(stream_key, turn_number, newly_released)
+        except Exception:
+            logger.exception("stage", stage="ai_response_generated", outcome="error", reason="groq_stream_interrupted")
+            capture_fallback("groq_stream_interrupted", call_id=call_id)
+            self._finish_stream_with_fallback(stream_key, turn_number)
+            return
+
+        final_sentences = streamer.finish()
+
+        if not full_text.strip():
+            logger.error("stage", stage="ai_response_generated", outcome="error", reason="empty_content")
+            capture_fallback("groq_returned_empty_content", call_id=call_id)
+            self._finish_stream_with_fallback(stream_key, turn_number)
+            return
+
+        session = self._store.get(call_id)
+        if session is None or session["turns"] != turn_number:
+            return
+        slots_by_id = {s["id"]: s for s in session["slots"]}
+        marker_match = _BOOKING_MARKER_RE.search(full_text)
+        if marker_match:
+            finalized = self._handle_booking_marker(call_id, session, slots_by_id, full_text, marker_match)
+        else:
+            session["messages"].append({"role": "assistant", "content": full_text})
+            finalized = {"reply_text": None, "hangup": False, "booking": None}
+        self._store.set(call_id, session, self._session_ttl_seconds)
+
+        # The final sentence(s) and done/finalized are written together in
+        # ONE store update - writing them separately would leave a window
+        # where a poller could see the last sentence appended but done
+        # still False, wrongly concluding more_coming=True for what's
+        # actually the final sentence (a real race hit during testing).
+        state = self._store.get(stream_key)
+        if state is None or state["turn_number"] != turn_number:
+            return
+        if final_sentences:
+            state["sentences"].extend(final_sentences)
+        state["done"] = True
+        state["finalized"] = finalized
+        self._store.set(stream_key, state, self._session_ttl_seconds)
+
+    def _append_sentences(self, stream_key: str, turn_number: int, sentences: list[str]) -> None:
+        state = self._store.get(stream_key)
+        if state is None or state["turn_number"] != turn_number:
+            return
+        state["sentences"].extend(sentences)
+        self._store.set(stream_key, state, self._session_ttl_seconds)
+
+    def _finish_stream_with_fallback(self, stream_key: str, turn_number: int) -> None:
+        state = self._store.get(stream_key)
+        if state is None or state["turn_number"] != turn_number:
+            return
+        state["done"] = True
+        state["finalized"] = {"reply_text": FALLBACK_MESSAGE, "hangup": True, "booking": None}
+        self._store.set(stream_key, state, self._session_ttl_seconds)
+
     def _handle_booking_marker(
         self, call_id: str, session: dict, slots_by_id: dict, content: str, match: re.Match
     ) -> dict:
@@ -316,3 +650,4 @@ class ConversationManager:
 
     def end_session(self, call_id: str) -> None:
         self._store.delete(call_id)
+        self._store.delete(self._stream_key(call_id))

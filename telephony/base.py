@@ -38,3 +38,11 @@ class TelephonyProvider(ABC):
         """Build the response for a follow-up turn: speak `reply_text`, then
         either keep listening for more speech (hangup=False) or end the
         call (hangup=True)."""
+
+    @abstractmethod
+    def build_continue_response(self, sentence_text: str, continue_url: str) -> Any:
+        """Build a mid-turn progressive-delivery response: speak just
+        `sentence_text`, then immediately fetch more of this same turn's
+        reply from `continue_url` - used while a streamed LLM response is
+        still being generated, so the caller starts hearing it sentence by
+        sentence rather than waiting for the whole thing."""

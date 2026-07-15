@@ -9,7 +9,7 @@ from typing import Mapping
 
 import structlog
 from twilio.request_validator import RequestValidator
-from twilio.twiml.voice_response import Gather, VoiceResponse
+from twilio.twiml.voice_response import Gather, Redirect, VoiceResponse
 
 from telephony.base import TelephonyProvider
 
@@ -75,17 +75,28 @@ class TwilioProvider(TelephonyProvider):
     def build_reply_response(self, reply_text: str, hangup: bool = False) -> str:
         response = VoiceResponse()
         if hangup:
-            response.say(reply_text, voice=_VOICE)
+            if reply_text:
+                response.say(reply_text, voice=_VOICE)
             response.hangup()
             return str(response)
 
         # No `action` given: Twilio defaults to re-posting to the current
         # request URL, i.e. /voice/handle-input again, continuing the loop.
         gather = Gather(input="speech", method="POST", speech_timeout="auto")
-        gather.say(reply_text, voice=_VOICE)
+        # reply_text can be empty when progressive delivery already spoke
+        # everything for this turn via prior <Say>+<Redirect> hits and this
+        # call is just the one that confirms "nothing more, start listening".
+        if reply_text:
+            gather.say(reply_text, voice=_VOICE)
         response.append(gather)
         response.say(_NO_INPUT_MESSAGE, voice=_VOICE)
         response.hangup()
+        return str(response)
+
+    def build_continue_response(self, sentence_text: str, continue_url: str) -> str:
+        response = VoiceResponse()
+        response.say(sentence_text, voice=_VOICE)
+        response.append(Redirect(continue_url, method="POST"))
         return str(response)
 
 
