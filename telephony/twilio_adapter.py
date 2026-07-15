@@ -15,16 +15,19 @@ from telephony.base import TelephonyProvider
 
 logger = structlog.get_logger(__name__)
 
-# Twilio speech-recognition locale per business language_pref. Twilio's
-# speech model must pick a single locale per call; it does not truly
-# code-switch mid-utterance, so this is a best-effort choice based on the
-# business's configured primary language, not a per-word decision.
-_LANGUAGE_LOCALES = {
-    "hindi": "hi-IN",
-    "bengali": "bn-IN",
-    "english": "en-IN",
-}
-_DEFAULT_LOCALE = "en-IN"
+# Twilio's Gather can only use ONE speech-recognition locale per call turn -
+# it does not auto-detect or switch language mid-utterance. Real production
+# data showed hi-IN is actively harmful for this app's actual callers: it
+# phonetically TRANSLITERATES clear English speech into Devanagari-script
+# garbage (e.g. "I have skin problem" became unreadable Hindi-script text)
+# rather than recognizing it as English, which then corrupted the LLM's
+# input and directly caused fallbacks and repeated clarifying questions.
+# en-IN tolerates Hindi/English code-switching far better than hi-IN
+# tolerates English, so it's used for every turn's speech recognition
+# regardless of the business's language_pref - that setting still controls
+# what language WE speak (greeting/confirmation templates), just not what
+# locale Twilio listens with.
+_STT_LOCALE = "en-IN"
 
 # A neutral Indian-English voice available on Twilio's Polly set.
 _VOICE = "Polly.Aditi"
@@ -56,13 +59,12 @@ class TwilioProvider(TelephonyProvider):
     def build_greeting_response(
         self, greeting_text: str, gather_action_url: str, language: str = "english"
     ) -> str:
-        locale = _LANGUAGE_LOCALES.get(language, _DEFAULT_LOCALE)
         response = VoiceResponse()
         gather = Gather(
             input="speech",
             action=gather_action_url,
             method="POST",
-            language=locale,
+            language=_STT_LOCALE,
             speech_timeout="auto",
         )
         gather.say(greeting_text, voice=_VOICE)
@@ -80,15 +82,13 @@ class TwilioProvider(TelephonyProvider):
             response.hangup()
             return str(response)
 
-        locale = _LANGUAGE_LOCALES.get(language, _DEFAULT_LOCALE)
         # No `action` given: Twilio defaults to re-posting to the current
         # request URL, i.e. /voice/handle-input again, continuing the loop.
-        # `language` matters here exactly as it does for the greeting's
-        # Gather: without it, every turn after the first silently used
-        # Twilio's own default locale (en-US) regardless of the business's
-        # configured language - a real, separate bug from the prompt's
-        # language-matching wording.
-        gather = Gather(input="speech", method="POST", language=locale, speech_timeout="auto")
+        # `language` (kept as a parameter for interface symmetry with
+        # build_greeting_response) is intentionally NOT used to pick the
+        # locale here - see _STT_LOCALE above for why every turn uses the
+        # same code-switch-tolerant locale regardless of business language.
+        gather = Gather(input="speech", method="POST", language=_STT_LOCALE, speech_timeout="auto")
         # reply_text can be empty when progressive delivery already spoke
         # everything for this turn via prior <Say>+<Redirect> hits and this
         # call is just the one that confirms "nothing more, start listening".

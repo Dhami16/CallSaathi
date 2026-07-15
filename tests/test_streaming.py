@@ -11,7 +11,9 @@ Run with: venv/Scripts/python -m pytest -q tests/test_streaming.py
 import time
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+from groq import APIError
 
 from ai.conversation import FALLBACK_MESSAGE, ConversationManager, SentenceStreamer
 from booking.db import init_db
@@ -105,13 +107,47 @@ def test_sentence_streamer_single_sentence_with_no_terminal_punctuation():
 
 
 # --- End-to-end streaming via ConversationManager ---------------------------
+#
+# Only replies that turn out to have MIN_SENTENCES_TO_STREAM_PROGRESSIVELY
+# (3) or more sentences are actually streamed sentence-by-sentence. Shorter
+# replies - the common case for this app's prompt-mandated 1-2 sentence
+# style - are delivered as a single classic block instead, so Twilio's
+# <Gather> is present and the caller can interrupt (barge-in), which
+# progressive per-sentence delivery cannot support (no <Gather> on
+# intermediate <Say>+<Redirect> steps). See MIN_SENTENCES_TO_STREAM_PROGRESSIVELY.
 
 
-def test_multi_sentence_response_delivered_progressively(manager):
-    call_id = "CALL-STREAM-MULTI"
+def test_two_sentence_reply_delivered_as_single_block_not_streamed(manager):
+    """The key regression this restructuring fixes: a 1-2 sentence reply
+    (the common case) must come back as ONE combined block with
+    more_coming=False, so call_handler uses a real <Gather>+<Say> (caller
+    can interrupt) instead of the no-Gather <Say>+<Redirect> chain."""
+    call_id = "CALL-STREAM-TWO-SENTENCES"
     _start_session(manager, call_id)
 
     stream = _fake_stream(["Sure, what's the reason ", "for your visit? ", "Also, what time works for you?"])
+    # NOTE: 3 chunks of TEXT above split into exactly 2 SENTENCES ("Sure...
+    # visit?" and "Also...you?") - deliberately under the streaming threshold.
+    with patch.object(manager._client.chat.completions, "create", MagicMock(return_value=stream)):
+        result = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
+
+    assert result["sentence"] == "Sure, what's the reason for your visit? Also, what time works for you?"
+    assert result["more_coming"] is False
+    assert result["hangup"] is False
+    assert result["booking"] is None
+
+
+def test_three_sentence_reply_streams_progressively(manager):
+    call_id = "CALL-STREAM-THREE-SENTENCES"
+    _start_session(manager, call_id)
+
+    stream = _fake_stream(
+        [
+            "Sure, what's the reason for your visit? ",
+            "We have slots tomorrow. ",
+            "Which time works best for you?",
+        ]
+    )
     with patch.object(manager._client.chat.completions, "create", MagicMock(return_value=stream)):
         first = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
 
@@ -120,10 +156,14 @@ def test_multi_sentence_response_delivered_progressively(manager):
     assert first["hangup"] is False
 
     second = manager.get_next_streamed_sentence(call_id, 1)
-    assert second["sentence"] == "Also, what time works for you?"
-    assert second["more_coming"] is False
-    assert second["hangup"] is False
-    assert second["booking"] is None
+    assert second["sentence"] == "We have slots tomorrow."
+    assert second["more_coming"] is True
+
+    third = manager.get_next_streamed_sentence(call_id, 2)
+    assert third["sentence"] == "Which time works best for you?"
+    assert third["more_coming"] is False
+    assert third["hangup"] is False
+    assert third["booking"] is None
 
 
 def test_single_sentence_response_still_works(manager):
@@ -166,19 +206,20 @@ def test_booking_confirming_turn_uses_deterministic_reply_not_streamed_text(mana
 
 
 def test_timeout_when_next_sentence_never_arrives_in_time(manager):
-    """LLM stalls indefinitely after the first sentence - get_next_streamed_
-    sentence must wait briefly, then fall back gracefully rather than
-    hanging or raising."""
+    """A reply confirmed to be 3+ sentences (progressive mode engaged), then
+    the LLM stalls indefinitely before the 4th - get_next_streamed_sentence
+    must wait briefly, then fall back gracefully rather than hanging or
+    raising."""
     call_id = "CALL-STREAM-TIMEOUT"
     _start_session(manager, call_id)
 
-    # Simulate a stall by having the generator pause after the first
-    # sentence. Trailing whitespace after "please." matters: that's what
-    # signals the sentence is actually complete (see SentenceStreamer) -
-    # without it, the text would just sit in the buffer, never released,
-    # which would test something else entirely.
+    # Trailing whitespace after each sentence matters: that's what signals a
+    # sentence is actually complete (see SentenceStreamer) - without it, the
+    # text just sits in the buffer, never released.
     def stalling_generator():
         yield _FakeChunk("Sure, one moment please. ")
+        yield _FakeChunk("We have slots tomorrow. ")
+        yield _FakeChunk("Which time works for you? ")
         time.sleep(5)  # far longer than the 2s next-sentence timeout used in this test
         yield _FakeChunk("Continuing...")
 
@@ -189,10 +230,81 @@ def test_timeout_when_next_sentence_never_arrives_in_time(manager):
     assert first["more_coming"] is True
 
     second = manager.get_next_streamed_sentence(call_id, 1)
-    assert second["sentence"] == FALLBACK_MESSAGE
-    assert second["more_coming"] is False
-    assert second["hangup"] is True
-    assert second["booking"] is None
+    assert second["sentence"] == "We have slots tomorrow."
+    assert second["more_coming"] is True
+
+    third = manager.get_next_streamed_sentence(call_id, 2)
+    assert third["sentence"] == "Which time works for you?"
+    # Still "more coming" per _consume_sentence's contract at this point:
+    # the stream isn't done yet, so this isn't confirmed as the last sentence.
+    assert third["more_coming"] is True
+
+    fourth = manager.get_next_streamed_sentence(call_id, 3)
+    assert fourth["sentence"] == FALLBACK_MESSAGE
+    assert fourth["more_coming"] is False
+    assert fourth["hangup"] is True
+    assert fourth["booking"] is None
+
+
+def test_mid_stream_harmony_glitch_retries_when_nothing_spoken_yet(manager):
+    """Real bug found in production: Groq's harmony-format glitch can raise
+    from WITHIN iterating the stream (a plain groq.APIError from the SSE
+    parser, body shaped as {"code": ...} rather than the nested
+    {"error": {"code": ...}} a BadRequestError from stream-creation has) -
+    not just from the initial call. Confirmed live: this used to fall
+    straight to the fallback message on the very first glitch. Since
+    nothing has been queued for delivery yet when it happens immediately,
+    it must retry instead."""
+    call_id = "CALL-STREAM-MIDGLITCH"
+    _start_session(manager, call_id)
+
+    fake_request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+
+    def failing_stream():
+        raise APIError(
+            message="Tool choice is none, but model called a tool",
+            request=fake_request,
+            body={"code": "tool_use_failed", "message": "boom"},
+        )
+        yield  # pragma: no cover - unreachable; makes this a generator function
+
+    def successful_stream():
+        yield _FakeChunk("Sure, what's the reason for your visit?")
+
+    mock_create = MagicMock(side_effect=[failing_stream(), successful_stream()])
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        result = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
+
+    assert mock_create.call_count == 2  # retried once, then succeeded
+    assert result["sentence"] == "Sure, what's the reason for your visit?"
+    assert result["more_coming"] is False
+    assert result["hangup"] is False
+
+
+def test_mid_stream_harmony_glitch_after_partial_delivery_falls_back_not_retries(manager):
+    """Once a sentence has actually been queued for delivery, a later
+    mid-stream glitch must NOT retry (that would regenerate content the
+    caller may already have heard) - it should fall back gracefully."""
+    call_id = "CALL-STREAM-MIDGLITCH-PARTIAL"
+    _start_session(manager, call_id)
+
+    fake_request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+
+    def failing_after_one_sentence_stream():
+        yield _FakeChunk("Sure, what's the reason for your visit? ")
+        raise APIError(
+            message="Tool choice is none, but model called a tool",
+            request=fake_request,
+            body={"code": "tool_use_failed", "message": "boom"},
+        )
+
+    mock_create = MagicMock(return_value=failing_after_one_sentence_stream())
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        result = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
+
+    assert mock_create.call_count == 1  # not retried
+    assert result["sentence"] == FALLBACK_MESSAGE
+    assert result["hangup"] is True
 
 
 def test_llm_finishes_before_all_sentences_requested_is_not_an_error(manager):

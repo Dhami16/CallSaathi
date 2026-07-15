@@ -23,7 +23,7 @@ import threading
 import time
 
 import structlog
-from groq import APIConnectionError, APITimeoutError, BadRequestError, Groq, InternalServerError
+from groq import APIConnectionError, APIError, APITimeoutError, BadRequestError, Groq, InternalServerError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from booking.session_store import DEFAULT_TTL_SECONDS, SessionStore
@@ -72,10 +72,32 @@ STREAM_FIRST_SENTENCE_TIMEOUT_SECONDS = 8.0
 STREAM_NEXT_SENTENCE_TIMEOUT_SECONDS = 4.0
 STREAM_POLL_INTERVAL_SECONDS = 0.15
 
+# Progressive per-sentence delivery drops Twilio's <Gather> from every
+# intermediate <Say>+<Redirect> step, which means the caller can't barge in
+# (interrupt) during those sentences - real regression reported after Task
+# 3 shipped. Since this app's replies are prompt-mandated to be 1-2
+# sentences in the common case, that meant nearly every reply lost
+# interruptibility for no real latency benefit (a 1-2 sentence reply doesn't
+# get materially "more real-time" from streaming). So: only replies that
+# turn out to have 3+ sentences are actually streamed progressively; a
+# reply that finishes at 1-2 sentences is delivered as a single classic
+# Gather+Say block (see _consume_initial_batch), restoring full
+# interruptibility for the common case at the cost of the (small) latency
+# win streaming would have given a short reply anyway.
+MIN_SENTENCES_TO_STREAM_PROGRESSIVELY = 3
 
-def _is_harmony_tool_glitch(error: BadRequestError) -> bool:
+
+def _is_harmony_tool_glitch(error: APIError) -> bool:
+    """Groq's SDK represents the same underlying glitch with two different
+    body shapes depending on where it surfaces: a BadRequestError from the
+    initial (non-streaming, or stream-creation) call nests the code under
+    body["error"]["code"]; a plain APIError raised mid-iteration by the
+    streaming SSE parser puts it directly at body["code"] instead. Handle
+    both - confirmed live that the mid-stream shape is real, not just
+    theoretical (it's what actually fired in production)."""
     body = error.body if isinstance(error.body, dict) else {}
-    return (body.get("error") or {}).get("code") == "tool_use_failed"
+    nested_code = body.get("error", {}).get("code") if isinstance(body.get("error"), dict) else None
+    return nested_code == "tool_use_failed" or body.get("code") == "tool_use_failed"
 
 
 class SentenceStreamer:
@@ -422,7 +444,60 @@ class ConversationManager:
         thread = threading.Thread(target=self._run_stream_worker, args=(call_id, turn_number), daemon=True)
         thread.start()
 
-        return self._consume_sentence(call_id, turn_number, sentence_index=0, timeout=self._stream_first_timeout)
+        return self._consume_initial_batch(call_id, turn_number)
+
+    def _consume_initial_batch(self, call_id: str, turn_number: int) -> dict:
+        """Waits for either MIN_SENTENCES_TO_STREAM_PROGRESSIVELY sentences
+        to be ready or the stream to finish, whichever comes first - this is
+        what decides whether a reply is short enough to deliver as one
+        classic Gather+Say block (restoring full interruptibility for the
+        common 1-2 sentence case) or genuinely long enough to stream
+        sentence by sentence. See MIN_SENTENCES_TO_STREAM_PROGRESSIVELY."""
+        stream_key = self._stream_key(call_id)
+        deadline = time.time() + self._stream_first_timeout
+
+        while True:
+            state = self._store.get(stream_key)
+            if state is None or state["turn_number"] != turn_number:
+                logger.warning(
+                    "stage", stage="ai_response_generated", outcome="error", reason="streaming_state_lost"
+                )
+                capture_fallback("streaming_state_lost", call_id=call_id)
+                return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+            sentences = state["sentences"]
+
+            if len(sentences) >= MIN_SENTENCES_TO_STREAM_PROGRESSIVELY:
+                # Confirmed long enough - hand off to real progressive
+                # delivery starting at the first sentence; /voice/continue
+                # fetches sentence_index=1, 2, ... via get_next_streamed_sentence.
+                return {"sentence": sentences[0], "more_coming": True, "hangup": False, "booking": None}
+
+            if state["done"]:
+                finalized = state.get("finalized") or {"reply_text": None, "hangup": False, "booking": None}
+                if finalized.get("reply_text"):
+                    # Booking confirmation, premature-marker correction, or
+                    # fallback message - always one deterministic block,
+                    # regardless of sentence count.
+                    return {
+                        "sentence": finalized["reply_text"],
+                        "more_coming": False,
+                        "hangup": finalized["hangup"],
+                        "booking": finalized.get("booking"),
+                    }
+                if not sentences:
+                    return {"sentence": None, "more_coming": False, "hangup": False, "booking": None}
+                # 1-2 sentences total: deliver as a single combined block.
+                return {"sentence": " ".join(sentences), "more_coming": False, "hangup": False, "booking": None}
+
+            if time.time() >= deadline:
+                logger.warning(
+                    "stage", stage="ai_response_generated", outcome="fallback_triggered", reason="streaming_timeout"
+                )
+                capture_fallback("streaming_reply_timeout", call_id=call_id)
+                return {"sentence": FALLBACK_MESSAGE, "more_coming": False, "hangup": True, "booking": None}
+
+            time.sleep(self._stream_poll_interval)
 
     def get_next_streamed_sentence(self, call_id: str, sentence_index: int) -> dict:
         """Called for each /voice/continue hit. Returns the same shape as
@@ -506,27 +581,46 @@ class ConversationManager:
         """Runs in a background thread, started by start_streaming_reply.
         Streams the Groq completion, writing sentences to the shared
         session store as they complete so /voice/continue hits (which may
-        land on a different worker process) can pick them up. The harmony-
-        glitch retry loop mirrors get_reply()'s exactly - only genuinely
-        transient errors (via _call_groq_stream's own tenacity retry) and
-        the harmony glitch are retried, and only before any content has
-        been produced; a failure mid-stream (after some sentences may
-        already be queued) is treated as final for this turn rather than
-        restarted, since restarting would regenerate content the caller may
-        have already partially heard.
+        land on a different worker process) can pick them up.
+
+        The harmony-glitch retry covers BOTH places it can actually surface
+        for a streaming request - confirmed live in production, not just in
+        theory: Groq's SDK sometimes raises it from the initial
+        stream-creation call (a BadRequestError, same as the non-streaming
+        path), but can ALSO raise it later, from WITHIN iterating the
+        stream (a plain groq.APIError from the SSE parser, with a
+        differently-shaped error body - see _is_harmony_tool_glitch). Only
+        genuinely transient errors (via _call_groq_stream's own tenacity
+        retry) and this glitch are retried, and a retry only happens if
+        nothing has been queued for delivery yet in this attempt - once a
+        sentence has been appended to the shared store (meaning the caller
+        may already have heard it), a later failure is treated as final for
+        this turn rather than restarted, since restarting would regenerate
+        content that might not follow on from what was already spoken.
         """
         stream_key = self._stream_key(call_id)
 
-        stream = None
         for attempt in range(1, MAX_GROQ_ATTEMPTS + 1):
             session = self._store.get(call_id)
             if session is None or session["turns"] != turn_number:
                 return  # turn no longer current (call ended/moved on) - nothing to do
+
+            streamer = SentenceStreamer()
+            full_text = ""
             try:
                 stream = self._call_groq_stream(session["messages"])
-                break
-            except BadRequestError as e:
-                if _is_harmony_tool_glitch(e) and attempt < MAX_GROQ_ATTEMPTS:
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    if not delta:
+                        continue
+                    full_text += delta
+                    newly_released = streamer.feed(delta)
+                    if newly_released:
+                        self._append_sentences(stream_key, turn_number, newly_released)
+            except APIError as e:
+                state = self._store.get(stream_key)
+                already_spoken = bool(state and state.get("sentences"))
+                if _is_harmony_tool_glitch(e) and not already_spoken and attempt < MAX_GROQ_ATTEMPTS:
                     logger.warning(
                         "stage",
                         stage="ai_response_generated",
@@ -536,8 +630,9 @@ class ConversationManager:
                         max_attempts=MAX_GROQ_ATTEMPTS,
                     )
                     continue
-                logger.exception("stage", stage="ai_response_generated", outcome="error", reason="groq_api_call_failed")
-                capture_fallback("groq_api_call_failed", call_id=call_id)
+                reason = "groq_stream_interrupted_after_partial_delivery" if already_spoken else "groq_api_call_failed"
+                logger.exception("stage", stage="ai_response_generated", outcome="error", reason=reason)
+                capture_fallback(reason, call_id=call_id)
                 self._finish_stream_with_fallback(stream_key, turn_number)
                 return
             except Exception:
@@ -545,25 +640,12 @@ class ConversationManager:
                 capture_fallback("groq_api_call_failed", call_id=call_id)
                 self._finish_stream_with_fallback(stream_key, turn_number)
                 return
-
-        if stream is None:
-            self._finish_stream_with_fallback(stream_key, turn_number)
-            return
-
-        streamer = SentenceStreamer()
-        full_text = ""
-        try:
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content or ""
-                if not delta:
-                    continue
-                full_text += delta
-                newly_released = streamer.feed(delta)
-                if newly_released:
-                    self._append_sentences(stream_key, turn_number, newly_released)
-        except Exception:
-            logger.exception("stage", stage="ai_response_generated", outcome="error", reason="groq_stream_interrupted")
-            capture_fallback("groq_stream_interrupted", call_id=call_id)
+            else:
+                break  # stream consumed successfully - proceed to finalize below
+        else:
+            # Loop exhausted every attempt without ever reaching the
+            # successful `else: break` above - shouldn't happen given the
+            # explicit returns in each except branch, but never hang.
             self._finish_stream_with_fallback(stream_key, turn_number)
             return
 

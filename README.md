@@ -164,7 +164,10 @@ Mitigations already in place (`ai/conversation.py`):
 In practice this means the overwhelming majority of calls complete
 normally; a small fraction end early with the graceful fallback instead of
 a booking. If Groq patches this server-side, `MAX_GROQ_ATTEMPTS` can likely
-be lowered back down.
+be lowered back down. For streaming requests specifically, this glitch can
+also surface mid-stream with a different error shape - see "Progressive
+(sentence-by-sentence) delivery" below for that variant and how retries
+handle it.
 
 A related, separate quirk measured during the streaming work (Task 3 of
 the performance session): for the specific booking-confirmation turn
@@ -184,35 +187,50 @@ Twilio's TwiML model only allows one complete document per webhook hit, so
 `stream=True` in a background thread, extracts sentences as they complete
 (`SentenceStreamer`), and writes them to the same session store used for
 conversation state (a `stream:<call_id>` key, not a separate mechanism).
-Each TwiML response speaks one sentence and `<Redirect>`s to
-`POST /voice/continue?idx=N`, which fetches the next one - so the caller
-starts hearing the reply before the model has finished generating all of
-it, rather than waiting for the complete response.
 
-Two deliberate trade-offs, made after finding real bugs while testing this:
+**Only replies confirmed to have `MIN_SENTENCES_TO_STREAM_PROGRESSIVELY`
+(3) or more sentences are actually streamed sentence-by-sentence** - each
+one spoken via `<Say>` then `<Redirect>`ed to `POST /voice/continue?idx=N`
+to fetch the next. A reply that finishes at 1-2 sentences (this app's
+prompt-mandated common case) is instead delivered as a single classic
+`<Gather><Say>...</Say></Gather>` block, exactly like the non-streaming
+path. This was a deliberate correction after real testing: Twilio's
+`<Gather>` (which is what lets a caller interrupt/barge in) is present on
+that single block, but is **absent** from every intermediate
+`<Say>+<Redirect>` step of a progressively-streamed reply - so streaming
+every reply meant losing the caller's ability to interrupt the agent for
+nearly every turn, for a latency win that barely exists on a 1-2 sentence
+reply anyway. Genuinely long (3+ sentence) replies still stream, and still
+lose mid-reply interruptibility - a trade-off accepted only for the rare
+case where it actually matters.
+
+Two more things worth knowing, both found via real production calls, not
+just testing:
 
 - **No artificial lag between sentences.** An earlier design held each
   sentence back by one step so a `BOOKING_CONFIRMED` marker appearing right
-  after it could suppress it before it was ever spoken. Measured effect:
-  it meant the *last two* sentences of every reply - which, for this app's
-  prompt-mandated 1-2 sentence replies, is *all of them* - never got
-  delivered progressively at all, defeating the point for the common case.
-  The shipped version releases each sentence immediately. The real,
-  accepted residual risk: if the model ever precedes a booking-confirming
-  marker with more than a token or two of spoken lead-in, that lead-in may
-  already have been spoken in addition to the deterministic confirmation
-  template. In testing, marker turns had zero leading spoken text, so this
-  hasn't been observed - but it's a possible minor redundancy, not a
-  correctness bug (the booking itself, and the database records, are
-  unaffected either way).
-- **Only the very first part of a stream retries on failure.** The
-  existing harmony-glitch and transient-error retries (Task 4 of the
-  reliability session) apply to getting the stream started and its first
-  content; a failure *mid-stream*, after the caller may already have heard
-  some sentences, is treated as final for that turn (falls back
-  gracefully) rather than restarting the whole generation, since a restart
-  would produce new content that might not follow on from what was already
-  spoken.
+  after it could suppress it before it was ever spoken. Measured effect: it
+  meant the *last two* sentences of every reply never got delivered
+  progressively at all. The shipped version releases each sentence
+  immediately. The real, accepted residual risk: if the model ever
+  precedes a booking-confirming marker with more than a token or two of
+  spoken lead-in, that lead-in may already have been spoken in addition to
+  the deterministic confirmation template. Not observed in testing, but
+  possible - a minor redundancy, not a correctness bug (the booking itself
+  is unaffected either way).
+- **The harmony-format glitch (see below) can raise from two different
+  places for a streaming request, not just one.** Groq's SDK sometimes
+  raises it from the initial stream-creation call (a `BadRequestError`,
+  same shape as the non-streaming path), but a real production call showed
+  it can ALSO raise later, from *within* iterating the stream itself (a
+  plain `groq.APIError` from the SSE parser, with a *differently shaped*
+  error body - nested `body["error"]["code"]` vs. flat `body["code"]`).
+  The retry logic now catches and detects both shapes. A retry only
+  happens if nothing has been queued for delivery yet in that attempt;
+  once a sentence has actually been queued (meaning the caller may already
+  have heard it), a later failure is treated as final for that turn
+  instead, since restarting would regenerate content that might not follow
+  on from what was already spoken.
 
 Known, out-of-scope limitation carried over from before this session,
 inherited rather than introduced: `call_handler.py`'s own `_calls` dict
@@ -221,8 +239,32 @@ conversation session) is still an in-memory, per-process dict. Under more
 than one gunicorn worker, a `/voice/continue` hit landing on a different
 worker than the one that started the turn wouldn't find it. This is the
 same class of bug the reliability session fixed for conversation history,
-but that fix didn't extend to this dict; out of scope to fix in this
-latency-only session.
+but that fix didn't extend to this dict; still out of scope to fix here.
+
+## Speech-recognition locale: always en-IN, regardless of business language
+
+Twilio's `<Gather>` uses one fixed locale per turn - it cannot auto-detect
+or switch language mid-call. Two real bugs were found and fixed across
+sessions here:
+
+1. `build_reply_response`'s `<Gather>` (used for every turn after the
+   greeting) originally never set a `language` locale at all, silently
+   falling back to Twilio's own default (`en-US`) regardless of the
+   business's configured language.
+2. Fixing (1) by using the business's `language_pref` (e.g. `hi-IN` for a
+   Hindi-preferred business) for every turn's locale then caused a *worse*
+   bug, confirmed against real call data: `hi-IN` **phonetically
+   transliterates clear English speech into unreadable Devanagari-script
+   garbage** rather than recognizing it as English (e.g. "I have skin
+   problem" was transcribed as nonsense Hindi-script text), which directly
+   corrupted the LLM's input and caused fallbacks and repeated clarifying
+   questions.
+
+Every turn's speech-recognition locale is now always `en-IN` (Indian
+English), which tolerates Hindi/English code-switching far better than
+`hi-IN` tolerates English, regardless of `language_pref`. That setting
+still controls what language the app itself speaks (greeting and
+confirmation templates) - just not what locale Twilio listens with.
 
 ## Latency notes (from the performance session)
 
