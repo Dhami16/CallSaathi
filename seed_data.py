@@ -19,6 +19,19 @@ SLOTS_CSV = DATA_DIR / "slots.csv"
 # current environment is actually wired up to - see README's .env setup step.
 DEMO_BUSINESS_NAME = "Radiant Skin Clinic"
 
+_WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def _next_occurrence(weekday_name: str, today: datetime.date) -> datetime.date:
+    """Next future date (never today) matching the given weekday name."""
+    target = _WEEKDAYS.index(weekday_name.strip().lower())
+    days_ahead = (target - today.weekday() - 1) % 7 + 1
+    return today + datetime.timedelta(days=days_ahead)
+
+
+def _to_24_hour(time_12h: str) -> str:
+    return datetime.datetime.strptime(time_12h.strip(), "%I:%M %p").strftime("%H:%M")
+
 
 def seed(db_path: str) -> int:
     """Imports businesses.csv and slots.csv. Returns the first business id."""
@@ -65,10 +78,10 @@ def seed(db_path: str) -> int:
                 if business_id is None or business_id not in newly_created_ids:
                     continue
 
-                slot_date = (today + datetime.timedelta(days=int(row["day_offset"]))).isoformat()
+                slot_date = _next_occurrence(row["days"], today).isoformat()
                 conn.execute(
                     "INSERT INTO slots (business_id, date, time, is_booked) VALUES (?, ?, ?, 0)",
-                    (business_id, slot_date, row["time"]),
+                    (business_id, slot_date, _to_24_hour(row["time"])),
                 )
 
         conn.commit()

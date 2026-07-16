@@ -1,6 +1,6 @@
-business_name,day_offset,time
-Radiant Skin Clinic,1,10:00
-Radiant Skin Clinic,1,15:30
-Radiant Skin Clinic,2,11:00
-Radiant Skin Clinic,2,16:00
-Radiant Skin Clinic,3,09:30
+business_name,days,time
+Radiant Skin Clinic,Monday,10:00 AM
+Radiant Skin Clinic,Monday,3:30 PM
+Radiant Skin Clinic,Tuesday,11:00 AM
+Radiant Skin Clinic,Tuesday,4:00 PM
+Radiant Skin Clinic,Wednesday,9:30 AM

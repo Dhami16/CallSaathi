@@ -103,7 +103,10 @@ needed).
    Edit those CSVs to manage which businesses and slots get seeded - add a
    row to add a business/slot, or edit one in place. Re-running the script
    only inserts rows for businesses that don't already exist yet (matched by
-   phone number).
+   phone number). `data/slots.csv` gives each slot a weekday name (e.g.
+   `Monday`) and a 12-hour time (e.g. `10:00 AM`); on import, the weekday is
+   resolved to its next upcoming date and the time is converted to 24-hour
+   for storage.
 
 4. **Run the app**:
    ```
