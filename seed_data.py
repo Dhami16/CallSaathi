@@ -1,5 +1,12 @@
-"""Idempotent data import from data/businesses.csv and data/slots.csv, so
-the app and tests have something to book against without any manual setup.
+"""Data import from data/businesses.csv and data/slots.csv, so the app and
+tests have something to book against without any manual setup.
+
+Businesses are inserted once (matched by phone number) and never touched
+again on later runs. Slots are synced every run: each business's unbooked
+slots are replaced with whatever data/slots.csv currently says, so editing
+the CSV and rerunning this script is enough to update available times.
+Booked slots (and all booking/call history) are never touched, since they're
+matched by is_booked = 0.
 
 Run directly: `python seed_data.py`
 """
@@ -34,13 +41,12 @@ def _to_24_hour(time_12h: str) -> str:
 
 
 def seed(db_path: str) -> int:
-    """Imports businesses.csv and slots.csv. Returns the first business id."""
+    """Imports businesses.csv and syncs slots.csv. Returns the first business id."""
     init_db(db_path)
     conn = get_connection(db_path)
     try:
         first_business_id = None
         name_to_id = {}
-        newly_created_ids = set()
 
         with open(BUSINESSES_CSV, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -61,21 +67,22 @@ def seed(db_path: str) -> int:
                         (name, row["vertical"], phone_number, row["language_pref"], int(row["active"])),
                     )
                     business_id = cursor.lastrowid
-                    newly_created_ids.add(business_id)
 
                 name_to_id[name] = business_id
                 if first_business_id is None:
                     first_business_id = business_id
 
-        # Slots are only seeded for businesses created in this run - an
-        # already-existing business was seeded (and possibly booked into)
-        # by an earlier run, so re-adding its starter slots would duplicate
-        # them.
+        # Replace each referenced business's unbooked slots with the CSV's
+        # current contents. Booked slots are left alone (is_booked = 0 in the
+        # DELETE), so past bookings and their history stay intact.
+        for business_id in set(name_to_id.values()):
+            conn.execute("DELETE FROM slots WHERE business_id = ? AND is_booked = 0", (business_id,))
+
         today = datetime.date.today()
         with open(SLOTS_CSV, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 business_id = name_to_id.get(row["business_name"])
-                if business_id is None or business_id not in newly_created_ids:
+                if business_id is None:
                     continue
 
                 slot_date = _next_occurrence(row["days"], today).isoformat()
