@@ -1,45 +1,78 @@
-"""Idempotent demo data: one business + a handful of open slots, so the app
-and tests have something to book against without any manual setup.
+"""Idempotent data import from data/businesses.csv and data/slots.csv, so
+the app and tests have something to book against without any manual setup.
 
 Run directly: `python seed_data.py`
 """
+import csv
 import datetime
 import os
+from pathlib import Path
 
 import config  # noqa: F401 - importing this loads .env before we read os.getenv below
 from booking.db import get_connection, init_db
 
-DEMO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+15005550006")
+DATA_DIR = Path(__file__).parent / "data"
+BUSINESSES_CSV = DATA_DIR / "businesses.csv"
+SLOTS_CSV = DATA_DIR / "slots.csv"
+
+# The one row whose phone number must match whatever Twilio number the
+# current environment is actually wired up to - see README's .env setup step.
+DEMO_BUSINESS_NAME = "Radiant Skin Clinic"
 
 
 def seed(db_path: str) -> int:
-    """Returns the demo business id (creates it if missing)."""
+    """Imports businesses.csv and slots.csv. Returns the first business id."""
     init_db(db_path)
     conn = get_connection(db_path)
     try:
-        row = conn.execute(
-            "SELECT id FROM businesses WHERE phone_number = ?", (DEMO_PHONE_NUMBER,)
-        ).fetchone()
-        if row:
-            return row["id"]
+        first_business_id = None
+        name_to_id = {}
+        newly_created_ids = set()
 
-        cursor = conn.execute(
-            """INSERT INTO businesses (name, vertical, phone_number, language_pref, active)
-               VALUES (?, ?, ?, ?, 1)""",
-            ("Radiant Skin Clinic", "clinic", DEMO_PHONE_NUMBER, "hindi"),
-        )
-        business_id = cursor.lastrowid
+        with open(BUSINESSES_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = row["name"]
+                phone_number = row["phone_number"]
+                if name == DEMO_BUSINESS_NAME:
+                    phone_number = os.getenv("TWILIO_PHONE_NUMBER", phone_number)
 
+                existing = conn.execute(
+                    "SELECT id FROM businesses WHERE phone_number = ?", (phone_number,)
+                ).fetchone()
+                if existing:
+                    business_id = existing["id"]
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO businesses (name, vertical, phone_number, language_pref, active)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (name, row["vertical"], phone_number, row["language_pref"], int(row["active"])),
+                    )
+                    business_id = cursor.lastrowid
+                    newly_created_ids.add(business_id)
+
+                name_to_id[name] = business_id
+                if first_business_id is None:
+                    first_business_id = business_id
+
+        # Slots are only seeded for businesses created in this run - an
+        # already-existing business was seeded (and possibly booked into)
+        # by an earlier run, so re-adding its starter slots would duplicate
+        # them.
         today = datetime.date.today()
-        for day_offset, time_str in [(1, "10:00"), (1, "15:30"), (2, "11:00"), (2, "16:00"), (3, "09:30")]:
-            slot_date = (today + datetime.timedelta(days=day_offset)).isoformat()
-            conn.execute(
-                "INSERT INTO slots (business_id, date, time, is_booked) VALUES (?, ?, ?, 0)",
-                (business_id, slot_date, time_str),
-            )
+        with open(SLOTS_CSV, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                business_id = name_to_id.get(row["business_name"])
+                if business_id is None or business_id not in newly_created_ids:
+                    continue
+
+                slot_date = (today + datetime.timedelta(days=int(row["day_offset"]))).isoformat()
+                conn.execute(
+                    "INSERT INTO slots (business_id, date, time, is_booked) VALUES (?, ?, ?, 0)",
+                    (business_id, slot_date, row["time"]),
+                )
 
         conn.commit()
-        return business_id
+        return first_business_id
     finally:
         conn.close()
 
@@ -49,4 +82,4 @@ if __name__ == "__main__":
 
     config = load_config()
     business_id = seed(config.database_path)
-    print(f"Seeded demo business id={business_id} at {config.database_path}")
+    print(f"Seeded businesses from {BUSINESSES_CSV} and slots from {SLOTS_CSV} at {config.database_path}")

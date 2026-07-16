@@ -92,13 +92,18 @@ needed).
    - `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` - from a Twilio trial account
      (https://www.twilio.com/try-twilio); a trial account includes one free
      phone number capable of receiving calls.
-   - `TWILIO_PHONE_NUMBER` - the Twilio number you got above. This must match
-     a `businesses.phone_number` row (the seed script uses this env var).
+   - `TWILIO_PHONE_NUMBER` - the Twilio number you got above. The seed script
+     uses this to set the demo business's phone number, overriding whatever
+     is in `data/businesses.csv`.
 
-3. **Seed demo data** (one business + a handful of open slots):
+3. **Seed demo data** (imports `data/businesses.csv` and `data/slots.csv`):
    ```
    venv\Scripts\python seed_data.py
    ```
+   Edit those CSVs to manage which businesses and slots get seeded - add a
+   row to add a business/slot, or edit one in place. Re-running the script
+   only inserts rows for businesses that don't already exist yet (matched by
+   phone number).
 
 4. **Run the app**:
    ```
