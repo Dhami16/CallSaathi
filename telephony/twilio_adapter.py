@@ -32,7 +32,8 @@ _STT_LOCALE = "en-IN"
 # A neutral Indian-English voice available on Twilio's Polly set.
 _VOICE = "Polly.Aditi"
 
-_NO_INPUT_MESSAGE = "Sorry, I didn't catch that. Please call back and try again."
+_NO_INPUT_RETRY_MESSAGE = "Sorry, I didn't catch that - could you say that again?"
+_NO_INPUT_MESSAGE = "Sorry, I still didn't catch that. Please call back and try again."
 
 
 class TwilioProvider(TelephonyProvider):
@@ -69,7 +70,20 @@ class TwilioProvider(TelephonyProvider):
         )
         gather.say(greeting_text, voice=_VOICE)
         response.append(gather)
-        # Reached only if the caller says nothing at all and Gather times out.
+        # Reached only if the caller says nothing usable and the first
+        # Gather times out. One retry before giving up: a single missed turn
+        # (background noise, a pause to think, a garbled word) used to end
+        # the whole call immediately, which is unforgiving for a real phone
+        # caller - see the retry Gather below.
+        retry_gather = Gather(
+            input="speech",
+            action=gather_action_url,
+            method="POST",
+            language=_STT_LOCALE,
+            speech_timeout="auto",
+        )
+        retry_gather.say(_NO_INPUT_RETRY_MESSAGE, voice=_VOICE)
+        response.append(retry_gather)
         response.say(_NO_INPUT_MESSAGE, voice=_VOICE)
         response.hangup()
         return str(response)
@@ -95,6 +109,10 @@ class TwilioProvider(TelephonyProvider):
         if reply_text:
             gather.say(reply_text, voice=_VOICE)
         response.append(gather)
+        # One retry before giving up - see build_greeting_response for why.
+        retry_gather = Gather(input="speech", method="POST", language=_STT_LOCALE, speech_timeout="auto")
+        retry_gather.say(_NO_INPUT_RETRY_MESSAGE, voice=_VOICE)
+        response.append(retry_gather)
         response.say(_NO_INPUT_MESSAGE, voice=_VOICE)
         response.hangup()
         return str(response)

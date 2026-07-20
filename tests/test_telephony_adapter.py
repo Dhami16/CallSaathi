@@ -43,3 +43,22 @@ def test_reply_response_hangup_true_does_not_need_a_locale():
     twiml = provider.build_reply_response("Goodbye!", hangup=True, language="hindi")
     assert "<Gather" not in twiml
     assert "<Hangup" in twiml
+
+
+def test_greeting_response_retries_once_before_giving_up_on_no_input():
+    """Real bug found in production: a single no-input timeout used to end
+    the whole call immediately with no second chance - unforgiving for a
+    real phone caller (background noise, a pause to think, etc.)."""
+    provider = TwilioProvider()
+    twiml = provider.build_greeting_response("Namaste!", "http://test/voice/handle-input", language="hindi")
+    assert twiml.count("<Gather") == 2
+    assert "didn't catch that - could you say that again" in twiml
+    assert "<Hangup" in twiml
+
+
+def test_reply_response_retries_once_before_giving_up_on_no_input():
+    provider = TwilioProvider()
+    twiml = provider.build_reply_response("Aapka din kaisa raha?", hangup=False, language="hindi")
+    assert twiml.count("<Gather") == 2
+    assert "didn't catch that - could you say that again" in twiml
+    assert "<Hangup" in twiml

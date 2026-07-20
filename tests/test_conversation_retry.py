@@ -111,3 +111,53 @@ def test_harmony_glitch_retry_is_unaffected_by_transient_retry_logic(manager):
     assert mock_create.call_count == 2
     assert result["reply_text"] == "Sure, what's the reason for your visit?"
     assert not result["hangup"]
+
+
+def test_repeated_question_triggers_nudge_and_regenerates(manager):
+    """Real bug found in production: the model sometimes re-asks the exact
+    question it just asked, ignoring that the caller already answered (a
+    caller answering "Rajdeep" to "what's your name?" got asked the
+    identical question every turn). Once detected, a corrective nudge
+    should regenerate the reply instead of repeating it forever."""
+    call_id = "CALL-REPEAT-NUDGE"
+    manager.start_session(call_id, DEMO_BUSINESS, DEMO_SLOTS)
+
+    mock_create = MagicMock(
+        side_effect=[
+            _make_completion("Could you tell me your name?"),
+            _make_completion("Could you tell me your name?"),  # about to repeat itself
+            _make_completion("Great, Rajdeep - and what's this appointment for?"),  # nudged correction
+        ]
+    )
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        r1 = manager.get_reply(call_id, "I need an appointment")
+        assert r1["reply_text"] == "Could you tell me your name?"
+
+        r2 = manager.get_reply(call_id, "Rajdeep")
+
+    assert mock_create.call_count == 3  # turn 1 (1 call) + turn 2 (repeat detected + 1 nudge regeneration)
+    assert r2["reply_text"] == "Great, Rajdeep - and what's this appointment for?"
+    assert not r2["hangup"]
+
+
+def test_repeated_question_nudge_failure_falls_back_to_repeated_content(manager):
+    """If the corrective nudge call itself fails, don't crash the turn or
+    end the call - just fall back to the (still repeated) content, exactly
+    as if no repeat had been detected at all."""
+    call_id = "CALL-REPEAT-NUDGE-FAIL"
+    manager.start_session(call_id, DEMO_BUSINESS, DEMO_SLOTS)
+
+    mock_create = MagicMock(
+        side_effect=[
+            _make_completion("Could you tell me your name?"),
+            _make_completion("Could you tell me your name?"),
+            RuntimeError("boom"),
+        ]
+    )
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        manager.get_reply(call_id, "I need an appointment")
+        r2 = manager.get_reply(call_id, "Rajdeep")
+
+    assert mock_create.call_count == 3
+    assert r2["reply_text"] == "Could you tell me your name?"
+    assert not r2["hangup"]

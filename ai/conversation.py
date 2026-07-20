@@ -54,6 +54,26 @@ TRANSIENT_RETRY_ATTEMPTS = 3  # 1 original attempt + 2 retries
 FALLBACK_MESSAGE = "I'm having trouble right now, let me have someone call you back shortly."
 _UNSURE_MESSAGE = "Sorry, could you say that again?"
 
+# Real production bug: gpt-oss-20b sometimes re-asks the exact question it
+# just asked, ignoring that the caller already answered (confirmed live -
+# a caller answering "Rajdeep" to "what's your name?" three turns running
+# got asked the identical question every single time). Detected by
+# comparing the new reply to the assistant's immediately preceding turn;
+# _NON_WORD_RE normalizes away punctuation/case so trivial rephrasing
+# ("Rajdeep?" vs "Rajdeep.") doesn't defeat the comparison.
+_NON_WORD_RE = re.compile(r"[^\w\s]")
+_REPEAT_NUDGE = (
+    "You just asked the caller the exact same question you asked last turn. "
+    "Their previous message was very likely already answering it - re-read "
+    "their last message and extract whatever it gives you (a name, a date, "
+    "anything), even if it's short, garbled, or imperfectly transcribed. "
+    "Do not ask this exact question again."
+)
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    return _NON_WORD_RE.sub("", text.lower()).strip()
+
 _PLACEHOLDER_TOKENS = {"unknown", "n/a", "na", "customer", "caller", "name", ""}
 
 # Not anchored to line start/end: the model sometimes appends this marker
@@ -358,6 +378,8 @@ class ConversationManager:
             capture_fallback("groq_returned_empty_content", call_id=call_id)
             return {"reply_text": FALLBACK_MESSAGE, "hangup": True, "booking": None}
 
+        content = self._regenerate_if_repeating(call_id, session, content)
+
         slots_by_id = {s["id"]: s for s in session["slots"]}
 
         marker_match = _BOOKING_MARKER_RE.search(content)
@@ -391,6 +413,38 @@ class ConversationManager:
             # the root cause in testing.
             reasoning_format="hidden",
         )
+
+    def _last_assistant_reply(self, session: dict) -> str | None:
+        for m in reversed(session["messages"]):
+            if m["role"] == "assistant":
+                return _BOOKING_MARKER_RE.sub("", m["content"]).strip()
+        return None
+
+    def _regenerate_if_repeating(self, call_id: str, session: dict, content: str) -> str:
+        """If `content` is essentially the same text as the assistant's
+        previous turn, the model likely ignored the caller's last answer and
+        is about to ask the same question again - see _REPEAT_NUDGE above.
+        Nudges it once with an explicit system reminder and regenerates
+        (a single extra, non-streamed Groq call - never looped further, so
+        this can't itself become unbounded); the nudge is NOT persisted into
+        session history, only used for this one corrective call. Falls back
+        to the original (repeated) content if the nudge call itself fails or
+        still doesn't produce anything usable."""
+        previous = self._last_assistant_reply(session)
+        if previous is None or _normalize_for_repeat_check(content) != _normalize_for_repeat_check(previous):
+            return content
+
+        logger.warning("stage", stage="ai_response_generated", outcome="retry", reason="repeated_question_detected")
+        capture_fallback("repeated_question_detected", call_id=call_id)
+
+        nudged_messages = session["messages"] + [{"role": "system", "content": _REPEAT_NUDGE}]
+        try:
+            completion = self._call_groq(nudged_messages)
+            new_content = (completion.choices[0].message.content or "").strip()
+            return new_content or content
+        except Exception:
+            logger.exception("stage", stage="ai_response_generated", outcome="error", reason="repeat_nudge_failed")
+            return content
 
     # --- Progressive (sentence-level streaming) delivery ------------------
     #
@@ -661,6 +715,23 @@ class ConversationManager:
         if session is None or session["turns"] != turn_number:
             return
         slots_by_id = {s["id"]: s for s in session["slots"]}
+
+        # Only safe to regenerate a repeated reply if nothing from THIS turn
+        # has already been spoken progressively (mirrors the already_spoken
+        # gate on the harmony-glitch retry above) - otherwise the caller may
+        # already have heard part of the repeated text.
+        state_before_finalize = self._store.get(stream_key)
+        already_spoken = bool(state_before_finalize and state_before_finalize.get("sentences"))
+        if not already_spoken:
+            regenerated = self._regenerate_if_repeating(call_id, session, full_text)
+            if regenerated != full_text:
+                full_text = regenerated
+                # The original streamer's buffered tail belongs to the
+                # discarded text - re-split the new text from scratch rather
+                # than reuse it.
+                fresh_streamer = SentenceStreamer()
+                final_sentences = fresh_streamer.feed(full_text) + fresh_streamer.finish()
+
         marker_match = _BOOKING_MARKER_RE.search(full_text)
         if marker_match:
             finalized = self._handle_booking_marker(call_id, session, slots_by_id, full_text, marker_match)

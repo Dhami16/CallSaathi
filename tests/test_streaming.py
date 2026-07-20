@@ -307,6 +307,35 @@ def test_mid_stream_harmony_glitch_after_partial_delivery_falls_back_not_retries
     assert result["hangup"] is True
 
 
+def test_streaming_repeated_question_triggers_nudge_and_regenerates(manager):
+    """Same production bug covered non-streaming in
+    test_conversation_retry.py, exercised through the actual live code path
+    (start_streaming_reply / _run_stream_worker, called by call_handler.py
+    on every real turn) rather than the non-streaming get_reply."""
+    call_id = "CALL-STREAM-REPEAT-NUDGE"
+    _start_session(manager, call_id)
+
+    first_stream = _fake_stream(["Could you tell me your name?"])
+    with patch.object(manager._client.chat.completions, "create", MagicMock(return_value=first_stream)):
+        first = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
+    assert first["sentence"] == "Could you tell me your name?"
+
+    # The model is about to repeat itself verbatim - the stream yields the
+    # identical text again, then the nudge regeneration (a plain
+    # non-streamed call) returns a corrected reply.
+    repeat_stream = _fake_stream(["Could you tell me your name?"])
+    nudge_completion = MagicMock()
+    nudge_completion.choices = [MagicMock(message=MagicMock(content="Great, Rajdeep - what's this for?"))]
+    mock_create = MagicMock(side_effect=[repeat_stream, nudge_completion])
+
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        second = manager.start_streaming_reply(call_id, "Rajdeep")
+
+    assert mock_create.call_count == 2
+    assert second["sentence"] == "Great, Rajdeep - what's this for?"
+    assert second["more_coming"] is False
+
+
 def test_llm_finishes_before_all_sentences_requested_is_not_an_error(manager):
     """If the caller asks for a sentence index that will never come because
     the (short) reply already fully finished, that's a normal end-of-turn,
