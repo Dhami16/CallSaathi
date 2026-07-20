@@ -8,6 +8,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+import structlog
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,6 +24,10 @@ class Config:
     database_path: str
     log_level: str
     public_base_url: str
+    env: str
+    sentry_dsn: str
+    internal_stats_token: str
+    session_ttl_seconds: int
 
 
 def load_config() -> Config:
@@ -35,11 +40,40 @@ def load_config() -> Config:
         database_path=os.getenv("DATABASE_PATH", "callsaathi.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         public_base_url=os.getenv("PUBLIC_BASE_URL", ""),
+        env=os.getenv("ENV", "development"),
+        sentry_dsn=os.getenv("SENTRY_DSN", ""),
+        internal_stats_token=os.getenv("INTERNAL_STATS_TOKEN", ""),
+        session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "600")),
     )
 
 
-def configure_logging(level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+def configure_logging(level: str, env: str) -> None:
+    """Configures structlog for the whole app. `env == "production"` gets
+    single-line JSON (log-aggregator friendly); anything else gets
+    structlog's pretty console renderer, since this is what a developer
+    actually wants to read in a terminal."""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+
+    # structlog wraps the stdlib logging module rather than replacing it, so
+    # third-party libraries (flask, twilio, groq's httpx client) still log
+    # normally; only our own structlog.get_logger() calls get the structured
+    # processors below.
+    logging.basicConfig(format="%(message)s", level=log_level)
+
+    shared_processors = [
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+    ]
+    if env == "production":
+        renderer = structlog.processors.JSONRenderer()
+    else:
+        renderer = structlog.dev.ConsoleRenderer()
+
+    structlog.configure(
+        processors=shared_processors + [renderer],
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
     )

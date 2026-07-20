@@ -3,18 +3,24 @@ call_handler.CallHandler, which is built from plain interfaces
 (TelephonyProvider, ConversationManager, BookingRepository,
 NotificationService). Nothing here ever touches a Twilio-specific type.
 """
-import logging
-
-from flask import Flask, Response, request
+import structlog
+from flask import Flask, Response, jsonify, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+from booking.db import init_db
 from config import configure_logging, load_config
+from observability import init_sentry
+from stats import compute_stats
 from telephony.twilio_adapter import TwilioProvider, validate_signature
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 config = load_config()
-configure_logging(config.log_level)
+configure_logging(config.log_level, config.env)
+init_sentry(config.sentry_dsn)
+# Eagerly (not just lazily inside build_default_call_handler) so /health and
+# /internal/stats work even before the first webhook hit creates the DB.
+init_db(config.database_path)
 
 app = Flask(__name__)
 # ngrok (and any reverse proxy) terminates HTTPS and forwards to Flask as
@@ -50,7 +56,7 @@ def _signature_valid() -> bool:
 @app.post("/voice")
 def voice():
     if not _signature_valid():
-        logger.warning("Rejected /voice request with invalid Twilio signature")
+        logger.warning("stage", stage="telephony_webhook_received", outcome="error", reason="invalid_signature", route="/voice")
         return Response(status=403)
 
     gather_action_url = request.url_root.rstrip("/") + "/voice/handle-input"
@@ -61,16 +67,53 @@ def voice():
 @app.post("/voice/handle-input")
 def voice_handle_input():
     if not _signature_valid():
-        logger.warning("Rejected /voice/handle-input request with invalid Twilio signature")
+        logger.warning(
+            "stage", stage="telephony_webhook_received", outcome="error", reason="invalid_signature", route="/voice/handle-input"
+        )
         return Response(status=403)
 
-    twiml = get_call_handler().handle_speech_input(dict(request.form))
+    continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
+    twiml = get_call_handler().handle_speech_input(dict(request.form), continue_url_base)
+    return Response(twiml, mimetype="text/xml")
+
+
+@app.post("/voice/continue")
+def voice_continue():
+    """Hit by Twilio's <Redirect> mid-turn, while a streamed LLM response is
+    still being progressively delivered sentence by sentence - see
+    ai/conversation.py's start_streaming_reply/get_next_streamed_sentence."""
+    if not _signature_valid():
+        logger.warning(
+            "stage", stage="telephony_webhook_received", outcome="error", reason="invalid_signature", route="/voice/continue"
+        )
+        return Response(status=403)
+
+    sentence_index = int(request.args.get("idx", 0))
+    continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
+    twiml = get_call_handler().handle_continue(dict(request.form), continue_url_base, sentence_index)
     return Response(twiml, mimetype="text/xml")
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def _internal_stats_authorized() -> bool:
+    """Shared-secret check appropriate for a two-person internal tool - not
+    full auth. Missing INTERNAL_STATS_TOKEN in config means the endpoint is
+    unusable (fails closed) rather than open."""
+    if not config.internal_stats_token:
+        return False
+    provided = request.headers.get("X-Internal-Token") or request.args.get("token", "")
+    return provided == config.internal_stats_token
+
+
+@app.get("/internal/stats")
+def internal_stats():
+    if not _internal_stats_authorized():
+        return Response(status=404)  # 404, not 403: don't confirm this route exists to an unauthenticated caller
+    return jsonify(compute_stats(config.database_path))
 
 
 if __name__ == "__main__":

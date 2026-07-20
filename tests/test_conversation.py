@@ -36,11 +36,13 @@ def _demo_slots():
 
 
 @pytest.fixture
-def manager():
+def manager(tmp_path):
     config = load_config()
     if not config.groq_api_key:
         pytest.skip("GROQ_API_KEY not set - see .env.example")
-    return ConversationManager(config.groq_api_key, config.groq_model)
+    db_path = str(tmp_path / "test_conversation_sessions.db")
+    init_db(db_path)
+    return ConversationManager(config.groq_api_key, config.groq_model, session_store=SQLiteSessionStore(db_path))
 
 
 def _say(manager, call_id, transcript, label):

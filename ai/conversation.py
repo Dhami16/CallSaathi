@@ -1,8 +1,10 @@
 """Conversational booking agent backed by Groq's openai/gpt-oss-20b model.
 
-Conversation history is kept in an in-memory dict keyed by call_id, since
-webhook hits are otherwise stateless. This is fine for a single-process MVP
-per spec and does not survive a process restart.
+Conversation history lives in an externalized SessionStore (see
+booking/session_store.py), not an in-memory dict - a plain dict silently
+breaks the moment there's more than one gunicorn worker process, since
+Twilio's sequential webhook hits for one call can land on different
+workers.
 
 Booking is driven by an explicit `BookingStage` state machine, not by
 scanning an LLM's own reply text for a marker. Each turn: a deterministic,
@@ -24,6 +26,7 @@ ai/slot_matching.py's module docstring for the bug this fixes.
 """
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -33,7 +36,10 @@ from groq import Groq
 from ai.intent_interpreter import BookingIntent, BookingIntentInterpreter
 from ai.slot_matching import match_requested_slot, parse_datetime_request, slots_on_date
 
-logger = logging.getLogger(__name__)
+from booking.session_store import DEFAULT_TTL_SECONDS, SessionStore
+from observability import capture_fallback
+
+logger = structlog.get_logger(__name__)
 
 MAX_TURNS = 12  # safety valve so a stuck/confused caller can't loop forever
 REQUEST_TIMEOUT_SECONDS = 8.0
@@ -251,9 +257,9 @@ class ConversationManager:
 
     def get_reply(self, call_id: str, transcript: str) -> dict:
         """Returns {"reply_text": str, "hangup": bool, "booking": dict | None}"""
-        session = self._sessions.get(call_id)
+        session = self._store.get(call_id)
         if session is None:
-            logger.error("get_reply called for unknown call_id=%s", call_id)
+            logger.error("stage", stage="ai_response_generated", outcome="error", reason="unknown_call_id")
             return {"reply_text": FALLBACK_MESSAGE, "hangup": True, "booking": None}
 
         session.turns += 1
@@ -506,7 +512,7 @@ class ConversationManager:
         return reply, False, None
 
     def get_transcript(self, call_id: str) -> str:
-        session = self._sessions.get(call_id)
+        session = self._store.get(call_id)
         if not session:
             return ""
         lines = []
@@ -516,10 +522,11 @@ class ConversationManager:
         return "\n".join(lines)
 
     def get_duration_seconds(self, call_id: str) -> int:
-        session = self._sessions.get(call_id)
+        session = self._store.get(call_id)
         if not session:
             return 0
         return int(time.monotonic() - session.started_at)
 
     def end_session(self, call_id: str) -> None:
-        self._sessions.pop(call_id, None)
+        self._store.delete(call_id)
+        self._store.delete(self._stream_key(call_id))
