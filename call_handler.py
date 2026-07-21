@@ -2,6 +2,7 @@
 booking -> notifications. This is where the three subsystems meet; app.py
 stays a thin Flask/webhook layer and never sees these details.
 """
+import re
 import time
 
 import sentry_sdk
@@ -22,6 +23,46 @@ _NO_BUSINESS_MESSAGE = "Sorry, this number isn't set up yet. Please try again la
 _REPEAT_MESSAGE = "Sorry, could you please repeat that?"
 _SLOT_TAKEN_MESSAGE = "Sorry, that slot was just taken. Let me have someone call you back shortly."
 
+# Real production bug: pure backchannel noises ("Mm-hmm", "Uh", "Um") that
+# Twilio's STT still transcribes as *something* (so they don't hit the
+# `not transcript` guard) were being passed straight through as if they were
+# the caller's real answer - burning a turn against MAX_TURNS and feeding
+# meaningless text to the LLM, which then produced an unpredictable reply.
+# Deliberately excludes words that carry real meaning in this domain even
+# alone (e.g. "yes"/"no"/"okay" answering a yes/no question) - only sounds
+# with no lexical content at all are filtered.
+_FILLER_WORDS = {"mm", "mm-hmm", "mmhmm", "mhm", "uh", "uhh", "um", "umm", "hmm", "hm", "huh", "erm"}
+_WORD_RE = re.compile(r"[a-z']+")
+
+
+def _is_filler_only(transcript: str) -> bool:
+    words = _WORD_RE.findall(transcript.lower())
+    return bool(words) and all(w in _FILLER_WORDS for w in words)
+
+
+def _format_time_hint(time_24h: str) -> str:
+    """Converts a 24-hour "HH:MM" slot time into the spoken form a caller
+    would actually say back (e.g. "16:00" -> "4 PM", "09:30" -> "9:30 AM"),
+    for Twilio Gather `hints` only - never shown/spoken to the caller, and
+    never fed to the LLM prompt (see ai/conversation.py's
+    _build_system_prompt, which has its own, separately-tuned slot format)."""
+    hour, _, minute = time_24h.partition(":")
+    hour, minute = int(hour), int(minute)
+    period = "AM" if hour < 12 else "PM"
+    hour_12 = hour % 12 or 12
+    return f"{hour_12} {period}" if minute == 0 else f"{hour_12}:{minute:02d} {period}"
+
+
+def _build_speech_hints(slots: list[dict]) -> str:
+    """Comma-separated phrases to bias Twilio's speech recognition toward -
+    real production bug: "9 AM" was transcribed as "99 AM" with nothing to
+    tell STT that a clinic's offered appointment times were the likely
+    subject of the utterance. Only the times themselves are hinted (not
+    dates): Gather hints work best as short, common phrases, and the times
+    are exactly the ambiguous, easily-misheard part."""
+    times = {_format_time_hint(s["time"]) for s in slots}
+    return ", ".join(sorted(times))
+
 
 class CallHandler:
     def __init__(
@@ -35,11 +76,6 @@ class CallHandler:
         self.conversation = conversation_manager
         self.repository = booking_repository
         self.notifications = notification_service
-        # Per-call bookkeeping the conversation manager doesn't need to know
-        # about (which business this call belongs to, and a turn counter for
-        # call_turns rows). Keyed by call_id, same lifetime as a
-        # ConversationManager session.
-        self._calls: dict[str, dict] = {}
 
     def handle_incoming_call(self, raw_request_data: dict, gather_action_url: str) -> str:
         turn_start = time.monotonic()
@@ -63,20 +99,22 @@ class CallHandler:
                 )
                 capture_fallback("no_business_configured_for_called_number", call_id=call_id)
                 self._write_turn(call_id, turn_number=0, turn_start=turn_start, response_out=_NO_BUSINESS_MESSAGE)
-                return self.telephony.build_reply_response(_NO_BUSINESS_MESSAGE, hangup=True)
+                return self.telephony.build_reply_response(_NO_BUSINESS_MESSAGE, gather_action_url, hangup=True)
 
             sentry_sdk.set_tag("business_id", business["id"])
             slots = self.repository.get_available_slots(business["id"])
             greeting = self.conversation.start_session(call_id, business, slots)
-            self._calls[call_id] = {"business": business, "turn_number": 0}
 
             self._write_turn(call_id, turn_number=0, turn_start=turn_start, response_out=greeting, llm_latency_ms=0)
 
             return self.telephony.build_greeting_response(
-                greeting, gather_action_url, business.get("language_pref", "english")
+                greeting,
+                gather_action_url,
+                business.get("language_pref", "english"),
+                hints=_build_speech_hints(slots),
             )
 
-    def handle_speech_input(self, raw_request_data: dict, continue_url_base: str) -> str:
+    def handle_speech_input(self, raw_request_data: dict, continue_url_base: str, gather_action_url: str) -> str:
         """First webhook hit of a turn. Kicks off progressive (sentence-by-
         sentence) delivery and returns as soon as the first thing to say is
         ready - see ai/conversation.py's start_streaming_reply. Subsequent
@@ -89,12 +127,9 @@ class CallHandler:
 
         with structlog.contextvars.bound_contextvars(call_id=call_id):
             sentry_sdk.set_tag("call_id", call_id)
-            call_meta = self._calls.get(call_id)
-            turn_number = None
+            call_meta = self.conversation.get_call_context(call_id)
             if call_meta is not None:
                 sentry_sdk.set_tag("business_id", call_meta["business"]["id"])
-                call_meta["turn_number"] += 1
-                turn_number = call_meta["turn_number"]
 
             logger.info(
                 "stage",
@@ -104,19 +139,37 @@ class CallHandler:
                 confidence=speech["confidence"],
             )
 
-            if not transcript:
-                logger.warning("stage", stage="speech_captured", outcome="error", reason="empty_transcript")
+            if not transcript or _is_filler_only(transcript):
+                reason = "empty_transcript" if not transcript else "filler_only_transcript"
+                logger.warning("stage", stage="speech_captured", outcome="error", reason=reason)
+                turn_number = call_meta["turn_number"] if call_meta is not None else None
                 self._write_turn(
-                    call_id, turn_number=turn_number, turn_start=turn_start, transcript_in="", response_out=_REPEAT_MESSAGE
+                    call_id,
+                    turn_number=turn_number,
+                    turn_start=turn_start,
+                    transcript_in=transcript,
+                    response_out=_REPEAT_MESSAGE,
                 )
-                language = call_meta["business"].get("language_pref", "english") if call_meta is not None else "english"
-                return self.telephony.build_reply_response(_REPEAT_MESSAGE, hangup=False, language=language)
+                business = call_meta["business"] if call_meta is not None else None
+                language = business.get("language_pref", "english") if business is not None else "english"
+                return self.telephony.build_reply_response(
+                    _REPEAT_MESSAGE,
+                    gather_action_url,
+                    hangup=False,
+                    language=language,
+                    hints=self._speech_hints_for(business),
+                )
 
             logger.info(
                 "stage", stage="speech_captured", outcome="success", transcript_length=len(transcript)
             )
 
             result = self.conversation.start_streaming_reply(call_id, transcript)
+            # Re-read after start_streaming_reply: that call is what
+            # increments the turn count, so the up-to-date turn_number for
+            # THIS turn's call_turns log row is only available afterward.
+            updated_meta = self.conversation.get_call_context(call_id)
+            turn_number = updated_meta["turn_number"] if updated_meta is not None else None
 
             return self._process_streaming_result(
                 call_id,
@@ -127,9 +180,12 @@ class CallHandler:
                 result,
                 next_sentence_index=1,
                 continue_url_base=continue_url_base,
+                gather_action_url=gather_action_url,
             )
 
-    def handle_continue(self, raw_request_data: dict, continue_url_base: str, sentence_index: int) -> str:
+    def handle_continue(
+        self, raw_request_data: dict, continue_url_base: str, sentence_index: int, gather_action_url: str
+    ) -> str:
         """Handles a <Redirect> hit fetching the next sentence of a turn
         already started by handle_speech_input. `sentence_index` is carried
         in the redirect URL's query string since each hit is a fresh,
@@ -140,7 +196,7 @@ class CallHandler:
 
         with structlog.contextvars.bound_contextvars(call_id=call_id):
             sentry_sdk.set_tag("call_id", call_id)
-            call_meta = self._calls.get(call_id)
+            call_meta = self.conversation.get_call_context(call_id)
             turn_number = call_meta["turn_number"] if call_meta is not None else None
             if call_meta is not None:
                 sentry_sdk.set_tag("business_id", call_meta["business"]["id"])
@@ -156,6 +212,7 @@ class CallHandler:
                 result=result,
                 next_sentence_index=sentence_index + 1,
                 continue_url_base=continue_url_base,
+                gather_action_url=gather_action_url,
             )
 
     def _process_streaming_result(
@@ -168,6 +225,7 @@ class CallHandler:
         result: dict,
         next_sentence_index: int,
         continue_url_base: str,
+        gather_action_url: str,
     ) -> str:
         sentence = result["sentence"]
         is_fallback = sentence == FALLBACK_MESSAGE and result["hangup"] and result["booking"] is None
@@ -187,7 +245,7 @@ class CallHandler:
             if not booked:
                 sentence = _SLOT_TAKEN_MESSAGE
         elif is_fallback:
-            call_meta = self._calls.get(call_id)
+            call_meta = self.conversation.get_call_context(call_id)
             if call_meta is not None:
                 # The AI layer gave up (Groq down/glitched/timed out
                 # mid-stream) and the call is ending without a booking.
@@ -197,7 +255,6 @@ class CallHandler:
         if result["hangup"]:
             logger.info("stage", stage="call_ended", outcome="fallback_triggered" if is_fallback else "success")
             self.conversation.end_session(call_id)
-            self._calls.pop(call_id, None)
 
         self._write_turn(
             call_id,
@@ -212,12 +269,24 @@ class CallHandler:
             continue_url = f"{continue_url_base}?idx={next_sentence_index}"
             return self.telephony.build_continue_response(sentence, continue_url)
 
-        call_meta = self._calls.get(call_id)
-        language = call_meta["business"].get("language_pref", "english") if call_meta is not None else "english"
-        return self.telephony.build_reply_response(sentence or "", hangup=result["hangup"], language=language)
+        call_meta = self.conversation.get_call_context(call_id)
+        business = call_meta["business"] if call_meta is not None else None
+        language = business.get("language_pref", "english") if business is not None else "english"
+        return self.telephony.build_reply_response(
+            sentence or "",
+            gather_action_url,
+            hangup=result["hangup"],
+            language=language,
+            hints=self._speech_hints_for(business),
+        )
+
+    def _speech_hints_for(self, business: dict | None) -> str:
+        if business is None:
+            return ""
+        return _build_speech_hints(self.repository.get_available_slots(business["id"]))
 
     def _finalize_booking(self, call_id: str, caller_number: str, booking: dict) -> bool:
-        call_meta = self._calls.get(call_id)
+        call_meta = self.conversation.get_call_context(call_id)
         if call_meta is None:
             logger.error("stage", stage="booking_result", outcome="error", reason="unknown_call_id")
             return False

@@ -328,6 +328,22 @@ class ConversationManager:
         self._store.set(call_id, session, self._session_ttl_seconds)
         return greeting
 
+    def get_call_context(self, call_id: str) -> dict | None:
+        """Returns {"business": dict, "turn_number": int} for an
+        in-progress call, or None if the session is missing/expired.
+        CallHandler used to keep this same information (which business a
+        call belongs to, its turn count) in its own plain in-process dict -
+        that silently returned None for any webhook hit landing on a
+        different gunicorn worker than the one that saw the call's earlier
+        turns, since each worker has separate process memory. Reading it
+        from this externalized session store instead (the same one
+        start_session/start_streaming_reply already write to) resolves
+        correctly regardless of which worker handles which hit."""
+        session = self._store.get(call_id)
+        if session is None:
+            return None
+        return {"business": session["business"], "turn_number": session["turns"]}
+
     def get_reply(self, call_id: str, transcript: str) -> dict:
         """Returns {"reply_text": str, "hangup": bool, "booking": dict | None}"""
         session = self._store.get(call_id)
@@ -489,14 +505,21 @@ class ConversationManager:
         self._store.set(call_id, session, self._session_ttl_seconds)
 
         stream_key = self._stream_key(call_id)
-        self._store.set(
-            stream_key,
-            {"turn_number": turn_number, "sentences": [], "done": False, "finalized": None},
-            self._session_ttl_seconds,
-        )
-
-        thread = threading.Thread(target=self._run_stream_worker, args=(call_id, turn_number), daemon=True)
-        thread.start()
+        if self._store.claim_turn(call_id, turn_number):
+            self._store.set(
+                stream_key,
+                {"turn_number": turn_number, "sentences": [], "done": False, "finalized": None},
+                self._session_ttl_seconds,
+            )
+            thread = threading.Thread(target=self._run_stream_worker, args=(call_id, turn_number), daemon=True)
+            thread.start()
+        # else: a concurrent or retried webhook hit already claimed this
+        # exact turn and its worker is (or already has) streaming the reply -
+        # don't touch stream_key (that would wipe out sentences the other
+        # worker already wrote) and don't start a second worker (that would
+        # be a second independent LLM completion for the same turn,
+        # interleaving into what the caller hears). Just poll the existing
+        # state below like any other consumer of this turn would.
 
         return self._consume_initial_batch(call_id, turn_number)
 
@@ -843,3 +866,4 @@ class ConversationManager:
     def end_session(self, call_id: str) -> None:
         self._store.delete(call_id)
         self._store.delete(self._stream_key(call_id))
+        self._store.clear_turn_claims(call_id)

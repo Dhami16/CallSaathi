@@ -92,3 +92,37 @@ def test_expired_sessions_are_purged_on_subsequent_writes(tmp_path):
 
     assert "CALL-OLD" not in remaining_ids
     assert "CALL-NEW" in remaining_ids
+
+
+def test_claim_turn_succeeds_once_and_fails_on_retry(tmp_path):
+    """Regression test for the real production bug this exists to prevent: a
+    Twilio webhook retry (or any concurrent duplicate hit) for the exact
+    same turn used to be indistinguishable from a genuinely new turn, so it
+    would spawn its OWN independent streaming worker - two LLM completions
+    for one turn, both appending into the same shared sentence list,
+    interleaving into what the caller heard. claim_turn makes "start a
+    worker for this turn" a one-time action, shared across separate
+    SessionStore instances (i.e. separate gunicorn workers)."""
+    db_path = str(tmp_path / "test_claims.db")
+    init_db(db_path)
+    worker_a_store = SQLiteSessionStore(db_path)
+    worker_b_store = SQLiteSessionStore(db_path)
+
+    assert worker_a_store.claim_turn("CALL-CLAIM-1", 1) is True
+    # A retried/concurrent webhook hit for the SAME turn, even from a
+    # different process/instance, must not also get to claim it.
+    assert worker_b_store.claim_turn("CALL-CLAIM-1", 1) is False
+    assert worker_a_store.claim_turn("CALL-CLAIM-1", 1) is False
+
+    # A genuinely new turn on the same call must claim successfully.
+    assert worker_a_store.claim_turn("CALL-CLAIM-1", 2) is True
+
+
+def test_clear_turn_claims_allows_call_id_reuse(tmp_path):
+    db_path = str(tmp_path / "test_claims.db")
+    init_db(db_path)
+    store = SQLiteSessionStore(db_path)
+
+    assert store.claim_turn("CALL-CLAIM-2", 1) is True
+    store.clear_turn_claims("CALL-CLAIM-2")
+    assert store.claim_turn("CALL-CLAIM-2", 1) is True

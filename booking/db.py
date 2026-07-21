@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS call_sessions (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_call_sessions_expires ON call_sessions(expires_at);
+
+-- Real bug found in production: a Twilio webhook retry for the same turn
+-- (e.g. a slow Groq response tripping Twilio's own retry-on-timeout
+-- behavior) landing on a different gunicorn worker used to read the same
+-- pre-increment turn count and spawn its OWN independent streaming Groq
+-- call for the identical turn, appending into the same shared sentence
+-- list as the original - the caller heard both completions' sentences
+-- interleaved in real time. The PRIMARY KEY here makes "claim this
+-- (call_id, turn_number)" an atomic insert: only the first request to try
+-- succeeds, so only one worker ever streams a given turn - see
+-- SessionStore.claim_turn.
+CREATE TABLE IF NOT EXISTS stream_turn_claims (
+    call_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (call_id, turn_number)
+);
 """
 
 

@@ -24,10 +24,10 @@ class FakeTelephonyProvider(TelephonyProvider):
     def parse_speech_result(self, raw_request_data):
         return raw_request_data
 
-    def build_greeting_response(self, greeting_text, gather_action_url, language="english"):
+    def build_greeting_response(self, greeting_text, gather_action_url, language="english", hints=""):
         return {"type": "greeting", "text": greeting_text}
 
-    def build_reply_response(self, reply_text, hangup=False, language="english"):
+    def build_reply_response(self, reply_text, gather_action_url, hangup=False, language="english", hints=""):
         return {"type": "reply", "text": reply_text, "hangup": hangup, "language": language}
 
     def build_continue_response(self, sentence_text, continue_url):
@@ -43,10 +43,17 @@ class FakeConversationManager:
         self.sessions = {}
 
     def start_session(self, call_id, business, slots):
-        self.sessions[call_id] = {"slots": {s["id"]: s for s in slots}}
+        self.sessions[call_id] = {"business": business, "slots": {s["id"]: s for s in slots}, "turns": 0}
         return f"Hello! You've reached {business['name']}."
 
+    def get_call_context(self, call_id):
+        session = self.sessions.get(call_id)
+        if session is None:
+            return None
+        return {"business": session["business"], "turn_number": session["turns"]}
+
     def start_streaming_reply(self, call_id, transcript):
+        self.sessions[call_id]["turns"] += 1
         slot = next(iter(self.sessions[call_id]["slots"].values()))
         return {
             "sentence": f"Booked for {slot['date']} at {slot['time']}!",
@@ -113,7 +120,9 @@ def test_full_call_creates_booking_and_notifications(db_path, capsys):
     print("Greeting:", greeting)
 
     speech_data = {**call_data, "transcript": "Mujhe kal appointment chahiye", "confidence": 0.9}
-    reply = handler.handle_speech_input(speech_data, continue_url_base="http://test/voice/continue")
+    reply = handler.handle_speech_input(
+        speech_data, continue_url_base="http://test/voice/continue", gather_action_url="http://test/voice/handle-input"
+    )
     print("Reply:", reply)
 
     # structlog's PrintLoggerFactory writes straight to stdout rather than

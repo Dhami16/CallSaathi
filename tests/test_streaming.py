@@ -336,6 +336,44 @@ def test_streaming_repeated_question_triggers_nudge_and_regenerates(manager):
     assert second["more_coming"] is False
 
 
+def test_duplicate_webhook_for_same_turn_does_not_spawn_a_second_worker(manager):
+    """Regression test for a real production bug: a Twilio webhook retry (or
+    any concurrent duplicate hit) for the exact same turn used to be
+    indistinguishable from a new turn, so it spawned its OWN independent
+    streaming Groq call, appending into the same shared sentence list as the
+    original - the caller heard both completions interleaved sentence by
+    sentence in real time. Simulates the race directly: the turn is already
+    claimed (as the first, in-flight request would have done) with some
+    sentences already streamed in, before the "duplicate" webhook hit calls
+    start_streaming_reply. The duplicate must NOT call Groq again, and must
+    just observe the already-in-progress state instead."""
+    call_id = "CALL-STREAM-DUPLICATE-WEBHOOK"
+    _start_session(manager, call_id)
+
+    stream_key = manager._stream_key(call_id)
+    # Turn 1 already claimed and partially streamed by the "original" request.
+    assert manager._store.claim_turn(call_id, 1) is True
+    manager._store.set(
+        stream_key,
+        {"turn_number": 1, "sentences": ["Sure, what's the reason for your visit?"], "done": False, "finalized": None},
+        manager._session_ttl_seconds,
+    )
+
+    mock_create = MagicMock(side_effect=AssertionError("Groq must not be called by the duplicate webhook hit"))
+    with patch.object(manager._client.chat.completions, "create", mock_create):
+        result = manager.start_streaming_reply(call_id, "Hi, I need an appointment")
+
+    assert mock_create.call_count == 0
+    # The duplicate observes the ORIGINAL request's in-progress state rather
+    # than starting its own - since only one sentence is queued so far (below
+    # MIN_SENTENCES_TO_STREAM_PROGRESSIVELY) and the stream isn't done yet,
+    # it just waits and then falls back once the timeout elapses, exactly
+    # like any other consumer polling an in-progress turn would - it never
+    # gets its own separate reply.
+    assert result["sentence"] == FALLBACK_MESSAGE
+    assert result["hangup"] is True
+
+
 def test_llm_finishes_before_all_sentences_requested_is_not_an_error(manager):
     """If the caller asks for a sentence index that will never come because
     the (short) reply already fully finished, that's a normal end-of-turn,

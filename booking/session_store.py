@@ -23,6 +23,7 @@ volume actually demands it - this is why SessionStore is an interface, so
 that swap wouldn't touch ai/conversation.py or call_handler.py at all.
 """
 import json
+import sqlite3
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -30,6 +31,7 @@ from typing import Optional
 from booking.db import get_connection
 
 DEFAULT_TTL_SECONDS = 600  # 10 minutes - generous for one phone call, bounds abandoned-call storage
+_CLAIM_MAX_AGE_SECONDS = 3600  # bounds stream_turn_claims growth for calls that never cleanly end_session
 
 
 class SessionStore(ABC):
@@ -44,6 +46,21 @@ class SessionStore(ABC):
     @abstractmethod
     def delete(self, call_id: str) -> None:
         """Removes the session immediately (call ended normally)."""
+
+    @abstractmethod
+    def claim_turn(self, call_id: str, turn_number: int) -> bool:
+        """Atomically claims (call_id, turn_number). Returns True the first
+        time this is called for a given turn - the caller should proceed to
+        start a new streaming worker. Returns False on every subsequent call
+        for the SAME turn (a concurrent or retried webhook hit for the exact
+        same turn) - the caller must NOT start a second worker, since two
+        independent LLM completions for the same turn would both append
+        their own sentences into the same shared stream state, interleaving
+        two overlapping replies into what the caller hears."""
+
+    @abstractmethod
+    def clear_turn_claims(self, call_id: str) -> None:
+        """Removes all claimed turns for a call (call ended normally)."""
 
 
 def _now_utc_naive() -> datetime:
@@ -103,6 +120,35 @@ class SQLiteSessionStore(SessionStore):
         conn = get_connection(self.db_path)
         try:
             conn.execute("DELETE FROM call_sessions WHERE call_id = ?", (call_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def claim_turn(self, call_id: str, turn_number: int) -> bool:
+        conn = get_connection(self.db_path)
+        try:
+            try:
+                conn.execute(
+                    "INSERT INTO stream_turn_claims (call_id, turn_number) VALUES (?, ?)",
+                    (call_id, turn_number),
+                )
+                claimed = True
+            except sqlite3.IntegrityError:
+                claimed = False
+            # Opportunistic cleanup, same pattern as set()'s expired-session
+            # sweep - piggybacked on writes that already happen rather than
+            # a separate cron/background job.
+            stale_before = _format(_now_utc_naive() - timedelta(seconds=_CLAIM_MAX_AGE_SECONDS))
+            conn.execute("DELETE FROM stream_turn_claims WHERE claimed_at < ?", (stale_before,))
+            conn.commit()
+            return claimed
+        finally:
+            conn.close()
+
+    def clear_turn_claims(self, call_id: str) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute("DELETE FROM stream_turn_claims WHERE call_id = ?", (call_id,))
             conn.commit()
         finally:
             conn.close()

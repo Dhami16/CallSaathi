@@ -58,15 +58,17 @@ class TwilioProvider(TelephonyProvider):
         }
 
     def build_greeting_response(
-        self, greeting_text: str, gather_action_url: str, language: str = "english"
+        self, greeting_text: str, gather_action_url: str, language: str = "english", hints: str = ""
     ) -> str:
         response = VoiceResponse()
+        gather_kwargs = {"hints": hints} if hints else {}
         gather = Gather(
             input="speech",
             action=gather_action_url,
             method="POST",
             language=_STT_LOCALE,
             speech_timeout="auto",
+            **gather_kwargs,
         )
         gather.say(greeting_text, voice=_VOICE)
         response.append(gather)
@@ -81,6 +83,7 @@ class TwilioProvider(TelephonyProvider):
             method="POST",
             language=_STT_LOCALE,
             speech_timeout="auto",
+            **gather_kwargs,
         )
         retry_gather.say(_NO_INPUT_RETRY_MESSAGE, voice=_VOICE)
         response.append(retry_gather)
@@ -88,7 +91,14 @@ class TwilioProvider(TelephonyProvider):
         response.hangup()
         return str(response)
 
-    def build_reply_response(self, reply_text: str, hangup: bool = False, language: str = "english") -> str:
+    def build_reply_response(
+        self,
+        reply_text: str,
+        gather_action_url: str,
+        hangup: bool = False,
+        language: str = "english",
+        hints: str = "",
+    ) -> str:
         response = VoiceResponse()
         if hangup:
             if reply_text:
@@ -96,13 +106,29 @@ class TwilioProvider(TelephonyProvider):
             response.hangup()
             return str(response)
 
-        # No `action` given: Twilio defaults to re-posting to the current
-        # request URL, i.e. /voice/handle-input again, continuing the loop.
-        # `language` (kept as a parameter for interface symmetry with
-        # build_greeting_response) is intentionally NOT used to pick the
-        # locale here - see _STT_LOCALE above for why every turn uses the
-        # same code-switch-tolerant locale regardless of business language.
-        gather = Gather(input="speech", method="POST", language=_STT_LOCALE, speech_timeout="auto")
+        # `action` MUST be set explicitly to gather_action_url (always the
+        # top-level /voice/handle-input endpoint, never a /voice/continue
+        # URL - see build_reply_response's docstring). This response can be
+        # reached either directly from /voice/handle-input (a short reply)
+        # or from /voice/continue (the last sentence of a progressively
+        # streamed one) - without an explicit action, Twilio defaults to
+        # re-posting to whichever of those URLs is currently handling the
+        # request, which silently misroutes the caller's next real answer
+        # to /voice/continue (a dead end that never reads speech input) once
+        # a reply happened to stream. `language` (kept as a parameter for
+        # interface symmetry with build_greeting_response) is intentionally
+        # NOT used to pick the locale here - see _STT_LOCALE above for why
+        # every turn uses the same code-switch-tolerant locale regardless of
+        # business language.
+        gather_kwargs = {"hints": hints} if hints else {}
+        gather = Gather(
+            input="speech",
+            action=gather_action_url,
+            method="POST",
+            language=_STT_LOCALE,
+            speech_timeout="auto",
+            **gather_kwargs,
+        )
         # reply_text can be empty when progressive delivery already spoke
         # everything for this turn via prior <Say>+<Redirect> hits and this
         # call is just the one that confirms "nothing more, start listening".
@@ -110,7 +136,14 @@ class TwilioProvider(TelephonyProvider):
             gather.say(reply_text, voice=_VOICE)
         response.append(gather)
         # One retry before giving up - see build_greeting_response for why.
-        retry_gather = Gather(input="speech", method="POST", language=_STT_LOCALE, speech_timeout="auto")
+        retry_gather = Gather(
+            input="speech",
+            action=gather_action_url,
+            method="POST",
+            language=_STT_LOCALE,
+            speech_timeout="auto",
+            **gather_kwargs,
+        )
         retry_gather.say(_NO_INPUT_RETRY_MESSAGE, voice=_VOICE)
         response.append(retry_gather)
         response.say(_NO_INPUT_MESSAGE, voice=_VOICE)

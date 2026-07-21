@@ -73,7 +73,8 @@ def voice_handle_input():
         return Response(status=403)
 
     continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
-    twiml = get_call_handler().handle_speech_input(dict(request.form), continue_url_base)
+    gather_action_url = request.url_root.rstrip("/") + "/voice/handle-input"
+    twiml = get_call_handler().handle_speech_input(dict(request.form), continue_url_base, gather_action_url)
     return Response(twiml, mimetype="text/xml")
 
 
@@ -90,7 +91,13 @@ def voice_continue():
 
     sentence_index = int(request.args.get("idx", 0))
     continue_url_base = request.url_root.rstrip("/") + "/voice/continue"
-    twiml = get_call_handler().handle_continue(dict(request.form), continue_url_base, sentence_index)
+    # Always /voice/handle-input, never this same /voice/continue route - if
+    # this turn's streamed reply is finishing here and starts listening
+    # again, the caller's next real answer must land on the endpoint that
+    # actually reads speech input, not this one (see build_reply_response's
+    # docstring for the bug this avoids).
+    gather_action_url = request.url_root.rstrip("/") + "/voice/handle-input"
+    twiml = get_call_handler().handle_continue(dict(request.form), continue_url_base, sentence_index, gather_action_url)
     return Response(twiml, mimetype="text/xml")
 
 
