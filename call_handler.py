@@ -16,6 +16,7 @@ from notifications.base import NotificationService
 from notifications.mock_service import MockNotificationService
 from observability import capture_fallback
 from telephony.base import TelephonyProvider
+from time_format import format_time_12h
 
 logger = structlog.get_logger(__name__)
 
@@ -40,19 +41,6 @@ def _is_filler_only(transcript: str) -> bool:
     return bool(words) and all(w in _FILLER_WORDS for w in words)
 
 
-def _format_time_hint(time_24h: str) -> str:
-    """Converts a 24-hour "HH:MM" slot time into the spoken form a caller
-    would actually say back (e.g. "16:00" -> "4 PM", "09:30" -> "9:30 AM"),
-    for Twilio Gather `hints` only - never shown/spoken to the caller, and
-    never fed to the LLM prompt (see ai/conversation.py's
-    _build_system_prompt, which has its own, separately-tuned slot format)."""
-    hour, _, minute = time_24h.partition(":")
-    hour, minute = int(hour), int(minute)
-    period = "AM" if hour < 12 else "PM"
-    hour_12 = hour % 12 or 12
-    return f"{hour_12} {period}" if minute == 0 else f"{hour_12}:{minute:02d} {period}"
-
-
 def _build_speech_hints(slots: list[dict]) -> str:
     """Comma-separated phrases to bias Twilio's speech recognition toward -
     real production bug: "9 AM" was transcribed as "99 AM" with nothing to
@@ -60,7 +48,7 @@ def _build_speech_hints(slots: list[dict]) -> str:
     subject of the utterance. Only the times themselves are hinted (not
     dates): Gather hints work best as short, common phrases, and the times
     are exactly the ambiguous, easily-misheard part."""
-    times = {_format_time_hint(s["time"]) for s in slots}
+    times = {format_time_12h(s["time"]) for s in slots}
     return ", ".join(sorted(times))
 
 

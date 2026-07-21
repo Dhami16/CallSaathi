@@ -29,9 +29,12 @@ def test_prompt_includes_business_name_and_vertical():
 
 
 def test_prompt_lists_given_slots_and_no_others():
+    """Slot times are pre-converted to 12-hour spoken form, never raw
+    24-hour "HH:MM" - a real production bug had gpt-oss-20b garble a 13:00
+    slot into "3 PM, at 13" when asked to verbalize 24-hour times itself."""
     prompt = _build_system_prompt(DEMO_BUSINESS, DEMO_SLOTS)
-    assert "id=1: 2026-07-16 at 10:00" in prompt
-    assert "id=2: 2026-07-16 at 15:30" in prompt
+    assert "id=1: 2026-07-16 at 10 AM" in prompt
+    assert "id=2: 2026-07-16 at 3:30 PM" in prompt
 
 
 def test_prompt_handles_no_available_slots():

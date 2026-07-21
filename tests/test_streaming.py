@@ -184,7 +184,8 @@ def test_booking_confirming_turn_uses_deterministic_reply_not_streamed_text(mana
     """The marker suppresses all progressive sentences (see SentenceStreamer
     tests above); the turn's actual reply comes from the same deterministic
     _CONFIRMATIONS template the non-streaming path uses, exactly as if this
-    had gone through get_reply()."""
+    had gone through get_reply(). No "language" field in the marker here -
+    falls back to the business's configured language_pref ("english")."""
     call_id = "CALL-STREAM-BOOKING"
     _start_session(manager, call_id)
 
@@ -202,7 +203,35 @@ def test_booking_confirming_turn_uses_deterministic_reply_not_streamed_text(mana
         "reason": "checkup",
     }
     assert "BOOKING_CONFIRMED" not in result["sentence"]
-    assert "2026-07-15" in result["sentence"] and "10:00" in result["sentence"]
+    # Spoken confirmation uses 12-hour form ("10 AM"), not the raw "10:00"
+    # stored in the booking dict above (that raw value is what's written to
+    # the DB and must stay unconverted).
+    assert "2026-07-15" in result["sentence"] and "10 AM" in result["sentence"]
+
+
+def test_booking_confirmation_uses_callers_actual_language_not_business_default(manager):
+    """Regression test for a real production bug: a caller who spoke English
+    the entire call still heard a Hindi confirmation, because the
+    confirmation used to always pick session["business"]["language_pref"]
+    (a fixed per-business setting) regardless of what language the LLM had
+    actually been replying in all call. The model now self-reports which
+    language it used via the marker's "language" field, and that must win
+    over the business default whenever it's present and valid."""
+    call_id = "CALL-STREAM-BOOKING-LANG"
+    _start_session(manager, call_id)  # DEMO_BUSINESS's language_pref is "english"
+
+    stream = _fake_stream(
+        [
+            'Great, Priya! BOOKING_CONFIRMED: {"slot_id": 1, "customer_name": "Priya", '
+            '"reason": "checkup", "language": "hindi"}'
+        ]
+    )
+    with patch.object(manager._client.chat.completions, "create", MagicMock(return_value=stream)):
+        result = manager.start_streaming_reply(call_id, "Haan theek hai, main Priya hoon")
+
+    assert result["hangup"] is True
+    assert "Bahut badhiya" in result["sentence"]  # the Hindi _CONFIRMATIONS template
+    assert "Great, your appointment" not in result["sentence"]
 
 
 def test_timeout_when_next_sentence_never_arrives_in_time(manager):

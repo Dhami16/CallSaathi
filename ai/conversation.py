@@ -28,6 +28,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from booking.session_store import DEFAULT_TTL_SECONDS, SessionStore
 from observability import capture_fallback
+from time_format import format_time_12h
 
 logger = structlog.get_logger(__name__)
 
@@ -230,9 +231,11 @@ _SLOT_OFFERING_STAGE = """2. Ask their preferred date/time.
 
 _CONFIRMATION_STAGE = """4. Only once the caller has clearly agreed to one specific slot AND you know
    their real name AND reason, add a final line in EXACTLY this format
-   (never spoken aloud, always in English):
-   BOOKING_CONFIRMED: {"slot_id": <id>, "customer_name": "<name>", "reason": "<reason>"}
-   Never guess or use a placeholder for name/reason.
+   (never spoken aloud, always in English, keys always in English):
+   BOOKING_CONFIRMED: {"slot_id": <id>, "customer_name": "<name>", "reason": "<reason>", "language": "<english|hindi|bengali>"}
+   Set "language" to exactly ONE of those three words - whichever language
+   you have been replying in for this call (see the language-matching rule
+   below). Never guess or use a placeholder for name/reason.
 5. Never add that line in your very first reply - ask reason and timing first."""
 
 _LANGUAGE_MATCHING_RULE = """- Reply in the SAME language the caller's most recent message used. If they
@@ -253,7 +256,14 @@ _GENERAL_RULES = """- 1-2 short sentences per reply - this is a live phone call.
 
 def _build_system_prompt(business: dict, slots: list[dict]) -> str:
     if slots:
-        slot_lines = "\n".join(f"- id={s['id']}: {s['date']} at {s['time']}" for s in slots[:3])
+        # Pre-converted to 12-hour spoken form (never raw 24-hour "HH:MM") -
+        # real production bug: asking gpt-oss-20b to verbalize a 24-hour
+        # time itself is unreliable arithmetic for a small model; a 13:00
+        # slot came out garbled as "3 PM, at 13" in a live call. Giving it
+        # the already-correct spoken form removes that arithmetic entirely.
+        slot_lines = "\n".join(
+            f"- id={s['id']}: {s['date']} at {format_time_12h(s['time'])}" for s in slots[:3]
+        )
     else:
         slot_lines = _NO_SLOTS_TEXT
 
@@ -831,9 +841,22 @@ class ConversationManager:
             session["messages"].append({"role": "assistant", "content": content})
             return {"reply_text": spoken_text or _UNSURE_MESSAGE, "hangup": False, "booking": None}
 
-        language = session["business"].get("language_pref", "english")
+        # Real production bug: this used to always be
+        # session["business"].get("language_pref", ...) - a fixed per-
+        # business setting - so a caller who spoke English the entire call
+        # still got a Hindi confirmation if that was the business's
+        # configured default, even though every other reply that turn
+        # correctly matched the caller's actual language (see
+        # _LANGUAGE_MATCHING_RULE). The model already tracks which language
+        # it's been replying in - trust its self-report here instead of
+        # re-deciding from a static setting, falling back to the business
+        # default only if it's missing or not one of the three known values.
+        reported_language = str(data.get("language", "")).strip().lower()
+        language = reported_language if reported_language in _CONFIRMATIONS else session["business"].get(
+            "language_pref", "english"
+        )
         reply_text = _CONFIRMATIONS.get(language, _CONFIRMATIONS["english"]).format(
-            date=slot["date"], time=slot["time"]
+            date=slot["date"], time=format_time_12h(slot["time"])
         )
         booking = {
             "slot_id": slot_id,
