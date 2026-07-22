@@ -9,7 +9,7 @@ from call_handler import _build_speech_hints, _is_filler_only
 
 
 def test_pure_filler_transcripts_are_detected():
-    for transcript in ["Mm-hmm", "Uh,", "Um,", "hmm", "Uh, um", "Huh?"]:
+    for transcript in ["Mm-hmm", "Uh,", "Um,", "hmm", "Uh, um", "Huh?", "Ah.", "Eh,"]:
         assert _is_filler_only(transcript) is True, transcript
 
 

@@ -37,6 +37,16 @@ def test_prompt_lists_given_slots_and_no_others():
     assert "id=2: 2026-07-16 at 3:30 PM" in prompt
 
 
+def test_prompt_forbids_speaking_the_internal_slot_id():
+    """Regression test for a real production bug: with real (larger,
+    accumulated) slot ids like 11 and 13, gpt-oss-20b read them out loud as
+    if they were meaningful ("It equals 11" / "It equals 13") instead of
+    just the date/time - the prompt must explicitly forbid this."""
+    prompt = _build_system_prompt(DEMO_BUSINESS, DEMO_SLOTS)
+    assert 'the "id=" number is for YOUR reference' in prompt
+    assert "never say it or any" in prompt
+
+
 def test_prompt_handles_no_available_slots():
     prompt = _build_system_prompt(DEMO_BUSINESS, [])
     assert "no slots currently available" in prompt

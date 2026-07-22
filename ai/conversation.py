@@ -226,7 +226,10 @@ _INTRO_STAGE = "You are a phone booking assistant for {name}, a {vertical}."
 _REASON_GATHERING_STAGE = "1. The greeting is already done. Ask the caller's reason for calling."
 
 _SLOT_OFFERING_STAGE = """2. Ask their preferred date/time.
-3. Offer these available slots (never invent others):
+3. Offer these available slots (never invent others). Only ever mention the
+   date and time to the caller - the "id=" number is for YOUR reference
+   only (to use later in the BOOKING_CONFIRMED line), never say it or any
+   part of it out loud:
 {slot_lines}"""
 
 _CONFIRMATION_STAGE = """4. Only once the caller has clearly agreed to one specific slot AND you know

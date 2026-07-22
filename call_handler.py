@@ -32,7 +32,9 @@ _SLOT_TAKEN_MESSAGE = "Sorry, that slot was just taken. Let me have someone call
 # Deliberately excludes words that carry real meaning in this domain even
 # alone (e.g. "yes"/"no"/"okay" answering a yes/no question) - only sounds
 # with no lexical content at all are filtered.
-_FILLER_WORDS = {"mm", "mm-hmm", "mmhmm", "mhm", "uh", "uhh", "um", "umm", "hmm", "hm", "huh", "erm"}
+_FILLER_WORDS = {
+    "mm", "mm-hmm", "mmhmm", "mhm", "uh", "uhh", "um", "umm", "hmm", "hm", "huh", "erm", "ah", "aah", "eh",
+}
 _WORD_RE = re.compile(r"[a-z']+")
 
 
