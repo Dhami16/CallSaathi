@@ -5,7 +5,31 @@ comments on _FILLER_WORDS and _build_speech_hints for the specifics).
 
 Run with: venv/Scripts/python -m pytest -q tests/test_call_handler_helpers.py
 """
-from call_handler import _build_speech_hints, _is_filler_only
+from dataclasses import dataclass
+
+from call_handler import _build_notification_service, _build_speech_hints, _is_filler_only
+from notifications.mock_service import MockNotificationService
+from notifications.twilio_sms_service import TwilioSMSNotificationService
+
+
+@dataclass
+class _FakeNotificationConfig:
+    notification_mode: str
+    twilio_account_sid: str = "AC-fake"
+    twilio_auth_token: str = "fake-token"
+    twilio_phone_number: str = "+15005550006"
+    owner_notification_phone: str = "+919999999999"
+    notification_allowlist: frozenset = frozenset()
+
+
+def test_notification_mode_defaults_to_mock_service():
+    service = _build_notification_service(_FakeNotificationConfig(notification_mode="mock"))
+    assert isinstance(service, MockNotificationService)
+
+
+def test_notification_mode_live_builds_real_sms_service():
+    service = _build_notification_service(_FakeNotificationConfig(notification_mode="live"))
+    assert isinstance(service, TwilioSMSNotificationService)
 
 
 def test_pure_filler_transcripts_are_detected():

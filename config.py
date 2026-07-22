@@ -20,6 +20,7 @@ class Config:
     groq_model: str
     twilio_account_sid: str
     twilio_auth_token: str
+    twilio_phone_number: str
     validate_twilio_signature: bool
     database_path: str
     log_level: str
@@ -28,6 +29,13 @@ class Config:
     sentry_dsn: str
     internal_stats_token: str
     session_ttl_seconds: int
+    notification_mode: str
+    owner_notification_phone: str
+    notification_allowlist: frozenset
+
+
+def _parse_allowlist(raw: str) -> frozenset:
+    return frozenset(number.strip() for number in raw.split(",") if number.strip())
 
 
 def load_config() -> Config:
@@ -36,6 +44,7 @@ def load_config() -> Config:
         groq_model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
         twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
         twilio_auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
+        twilio_phone_number=os.getenv("TWILIO_PHONE_NUMBER", ""),
         validate_twilio_signature=os.getenv("VALIDATE_TWILIO_SIGNATURE", "true").lower() == "true",
         database_path=os.getenv("DATABASE_PATH", "callsaathi.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -44,6 +53,9 @@ def load_config() -> Config:
         sentry_dsn=os.getenv("SENTRY_DSN", ""),
         internal_stats_token=os.getenv("INTERNAL_STATS_TOKEN", ""),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "600")),
+        notification_mode=os.getenv("NOTIFICATION_MODE", "mock").strip().lower(),
+        owner_notification_phone=os.getenv("OWNER_NOTIFICATION_PHONE", ""),
+        notification_allowlist=_parse_allowlist(os.getenv("NOTIFICATION_ALLOWLIST", "")),
     )
 
 

@@ -14,6 +14,7 @@ from booking.repository import BookingRepository, SlotUnavailableError
 from booking.session_store import SQLiteSessionStore
 from notifications.base import NotificationService
 from notifications.mock_service import MockNotificationService
+from notifications.twilio_sms_service import TwilioSMSNotificationService
 from observability import capture_fallback
 from telephony.base import TelephonyProvider
 from time_format import format_time_12h
@@ -369,10 +370,27 @@ class CallHandler:
         )
 
 
+def _build_notification_service(config) -> NotificationService:
+    """NOTIFICATION_MODE picks the implementation - defaults to "mock" so
+    nothing sends a real, billed message without explicit opt-in (see
+    .env.example). This is the one place that decision is made; nothing
+    else in the app knows or cares which NotificationService it got."""
+    if config.notification_mode == "live":
+        return TwilioSMSNotificationService(
+            account_sid=config.twilio_account_sid,
+            auth_token=config.twilio_auth_token,
+            from_number=config.twilio_phone_number,
+            owner_phone=config.owner_notification_phone,
+            allowlist=config.notification_allowlist,
+        )
+    return MockNotificationService()
+
+
 def build_default_call_handler(config, telephony_provider: TelephonyProvider) -> CallHandler:
-    """Wires up the concrete production dependencies (Groq, SQLite, mock
-    notifications) into a CallHandler. Tests build a CallHandler directly
-    with their own fakes/temp DB instead of using this factory."""
+    """Wires up the concrete production dependencies (Groq, SQLite,
+    mock-or-live notifications) into a CallHandler. Tests build a
+    CallHandler directly with their own fakes/temp DB instead of using this
+    factory."""
     if not config.groq_api_key:
         raise RuntimeError("GROQ_API_KEY is required to run the app (see .env.example)")
 
@@ -387,5 +405,5 @@ def build_default_call_handler(config, telephony_provider: TelephonyProvider) ->
             session_ttl_seconds=config.session_ttl_seconds,
         ),
         booking_repository=BookingRepository(config.database_path),
-        notification_service=MockNotificationService(),
+        notification_service=_build_notification_service(config),
     )

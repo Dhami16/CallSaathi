@@ -16,9 +16,12 @@ with the full call transcript.
   than waiting for the whole response - see "Progressive delivery" below.
 - Persists the booking, the booked slot, and the **full** call transcript to
   SQLite.
-- "Notifies" the business owner (full transcript + booking details) and the
-  customer (short confirmation) - currently by logging, not by actually
-  sending WhatsApp/SMS (see [Non-goals](#non-goals-for-this-mvp)).
+- Notifies the business owner (full transcript + booking details) and the
+  customer (short confirmation) - by default via `MockNotificationService`
+  (logs what would be sent), or by real SMS via
+  `TwilioSMSNotificationService` when `NOTIFICATION_MODE=live` - see
+  [Notifications](#notifications-mock-vs-live-sms) below. WhatsApp sending
+  is still not implemented (see [Non-goals](#non-goals-for-this-mvp)).
 
 ## Architecture
 
@@ -36,7 +39,9 @@ booking/repository.py  Data access: businesses, slots (future-only, IST-aware),
                        bookings (idempotent per call_id), call_logs, call_turns.
 booking/session_store.py  Externalized conversation session state (SQLite-
                        backed) - see "Session state" below.
-notifications/         NotificationService interface + MockNotificationService.
+notifications/         NotificationService interface + MockNotificationService
+                       (default, logs only) + TwilioSMSNotificationService
+                       (real SMS, opt-in via NOTIFICATION_MODE=live).
 call_handler.py        Orchestrates telephony -> AI -> booking -> notifications.
                        app.py never touches these subsystems directly.
 observability.py       Sentry init + non-fatal fallback event capture.
@@ -46,9 +51,10 @@ seed_data.py           Idempotent demo business + slots.
 ```
 
 Swapping the telephony vendor means writing a new adapter file implementing
-`TelephonyProvider` - nothing else changes. Swapping mock notifications for
-real WhatsApp/SMS means writing a new `NotificationService` - booking logic
-is untouched.
+`TelephonyProvider` - nothing else changes. Swapping notification
+implementations (mock, SMS, and eventually WhatsApp) means writing a new
+`NotificationService` and pointing `NOTIFICATION_MODE` at it - booking logic
+is untouched either way.
 
 ## Session state: SQLite now, Redis later if needed
 
@@ -77,6 +83,76 @@ Sessions expire after `SESSION_TTL_SECONDS` (default 600s / 10 min) so an
 abandoned or crashed call doesn't leak state forever; expired rows are
 cleaned up opportunistically on every write (no background job/cron
 needed).
+
+## Notifications: mock vs. live SMS
+
+`NOTIFICATION_MODE` (see `.env.example`) picks which `NotificationService`
+`call_handler.py` uses - decided in exactly one place
+(`_build_notification_service` in `call_handler.py`), so nothing else in the
+app knows or cares which one is active:
+
+- **`mock` (default)** - `MockNotificationService` logs what would be sent
+  (`notification_sent` log lines) instead of actually sending anything. This
+  is the safe default: nothing sends a real, billed message unless you
+  explicitly opt in.
+- **`live`** - `TwilioSMSNotificationService` sends real SMS via Twilio's
+  Messaging API, using the same `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`
+  already configured, from `TWILIO_PHONE_NUMBER`. A failed send (invalid
+  number, Twilio 5xx, network error) is retried once, then logged as an
+  error and reported to Sentry (via `capture_fallback`) - it never fails or
+  crashes the call itself, since the booking already happened regardless of
+  whether the notification about it was delivered.
+
+WhatsApp is **not implemented** in either mode: Twilio's WhatsApp Sandbox
+requires each recipient to manually send a join code first, which doesn't
+work for arbitrary real customers, and real production WhatsApp needs Meta
+Business Manager verification that hasn't happened yet. SMS needs neither,
+so it's the right fit for pilot stage. WhatsApp can be added later as
+another `NotificationService` implementation without touching booking logic
+or this switch.
+
+**Known gap in `live` mode:** there's currently no "owner's phone number"
+field on a business (`businesses.phone_number` is the Twilio number
+*customers* call, not a phone the owner carries) - so owner notifications in
+live mode go to a single `OWNER_NOTIFICATION_PHONE` env var, shared across
+every business, rather than being looked up per business. Fine for the
+current one-demo-business pilot; would need a real `owner_phone` column
+(and CSV field) before onboarding a second paying business.
+
+### Testing `live` mode safely for the first time
+
+Sending a real SMS costs real money and can reach a real phone, so test it
+deliberately rather than flipping `NOTIFICATION_MODE=live` against your full
+setup right away:
+
+1. Set `NOTIFICATION_MODE=live` and `OWNER_NOTIFICATION_PHONE` to **your
+   own** phone number (E.164, e.g. `+919876543210`) in `.env`.
+2. Set `NOTIFICATION_ALLOWLIST` to that same number (and/or a friend's, if
+   they're in on the test) - comma-separated if more than one. This is the
+   guardrail: `TwilioSMSNotificationService` will only actually text numbers
+   on this list. Any other recipient (e.g. a real caller's phone number
+   during a live test call, or the wrong number typed into a booking) is
+   **skipped**, with a `notification_skipped` log line explaining why
+   (`reason="not_in_allowlist"`), instead of silently texting a stranger.
+3. Make a real test call (see "Setup" below) and complete a booking with
+   your own phone as the caller.
+4. Watch the logs for `notification_sent` (channel=`owner` and
+   channel=`customer`) - a real send looks like:
+   ```
+   notification_sent channel=owner to=+919876543210
+   notification_sent channel=customer to=+919876543210
+   ```
+   A skipped one (wrong number, not on the allowlist) looks like:
+   ```
+   notification_skipped channel=customer to=+91... reason=not_in_allowlist
+   ```
+   A failed send (after its retry is exhausted) looks like:
+   ```
+   notification_send_failed channel=owner to=+919876543210 error=...
+   ```
+   and is also reported to Sentry if `SENTRY_DSN` is configured.
+5. Once you trust it, remove `NOTIFICATION_ALLOWLIST` (leave it blank) so
+   real customers' numbers aren't skipped once a business is actually live.
 
 ## Setup
 
@@ -311,9 +387,10 @@ was ~0-1ms in almost every turn). Two things worth knowing before touching
 - [x] Out-of-scope questions (pricing, medical advice) are declined in-scope.
 - [x] A confirmed booking marks the slot booked, writes a `bookings` row and
       a `call_logs` row with the **full** transcript, all in SQLite.
-- [x] The owner "notification" logs the full transcript + booking details;
-      the customer "notification" logs a short confirmation. Both are mocked
-      (logged, not sent) by design for this MVP.
+- [x] The owner notification carries the full transcript + booking details;
+      the customer notification is a short confirmation. Mocked (logged, not
+      sent) by default; real SMS sending is available opt-in via
+      `NOTIFICATION_MODE=live` (see [Notifications](#notifications-mock-vs-live-sms)).
 - [x] Groq failures/timeouts/malformed responses never leave dead air or an
       un-ended call; transient failures (timeout/connection/5xx) get a
       small bounded retry with backoff before falling back.
@@ -323,15 +400,16 @@ was ~0-1ms in almost every turn). Two things worth knowing before touching
       handling the same call (no more in-memory-dict-per-process).
 - [x] A retried webhook for an already-confirmed booking is a no-op, not a
       duplicate booking or a duplicate owner/customer notification.
-- [ ] Manual-only, not automatable here: getting a Twilio trial number and
+- [x] Manual-only, not automatable here: getting a Twilio trial number and
       auth token, running ngrok, and pointing the Twilio console's webhook
-      at the tunnel URL (steps 2-6 above) - do this once to test a real
-      live call end-to-end.
+      at the tunnel URL (steps 2-6 above) - tested against real live calls,
+      both Hindi-heavy and English, both completing bookings end-to-end.
 - [x] Replies are delivered sentence-by-sentence as Groq streams them,
       instead of the caller waiting for the entire response.
 - Explicitly **not** built (see product spec): owner dashboard, calendar
   sync, payments, multi-location/staff routing, outbound calling, real
-  WhatsApp/SMS sending.
+  WhatsApp sending (real SMS sending now exists - see
+  [Notifications](#notifications-mock-vs-live-sms)).
 
 ## Task 4 research: Twilio Media Streams (not implemented - recommendation only)
 
